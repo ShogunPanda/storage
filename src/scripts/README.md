@@ -64,6 +64,9 @@ ADMIN_URL=... ADMIN_API_KEY=... JOBS_SOURCE=backup npm run jobs:list
 
 ## Semantics
 
+- Restore is rejected when `DATABASE_ENGINE=oriole`: OrioleDB can misclassify valid rows as
+  conflicts for pg-boss partial indexes, which would otherwise delete backup rows without
+  restoring them.
 - List responses report `sourceTableExists` for the selected source. The live job table is present
   when a live query succeeds; backup-source queries return `false` until the backup table exists.
 - Backup needs a filter or `JOBS_BACKUP_CONFIRM_ALL=true`.

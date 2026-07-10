@@ -154,6 +154,7 @@ async function cleanupTestJobs(db: PgExecutor | undefined = queryDb) {
 // causing restore to discard valid backup rows as conflicts.
 describe.skipIf(process.env.DATABASE_ENGINE === 'oriole')('Admin queue overflow routes', () => {
   beforeAll(async () => {
+    getConfig()
     mergeConfig({ pgQueueEnable: true })
     await migrations.runMultitenantMigrations()
     const config = getConfig()

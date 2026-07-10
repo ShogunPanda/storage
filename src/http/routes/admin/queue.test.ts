@@ -102,4 +102,42 @@ describe('admin queue routes', () => {
       await app.close()
     }
   })
+
+  it('rejects queue overflow restore on OrioleDB', async () => {
+    vi.resetModules()
+
+    const { getConfig, mergeConfig } = await import('../../../config')
+    getConfig()
+    mergeConfig({
+      pgQueueEnable: true,
+      adminApiKeys: 'test-admin-key',
+      databaseEngine: 'oriole',
+    })
+
+    const fastify = (await import('fastify')).default
+    const { default: routes } = await import('./queue')
+
+    const app = fastify()
+    app.register(routes, { prefix: '/queue' })
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/queue/overflow/restore',
+        headers: {
+          apikey: 'test-admin-key',
+        },
+        payload: {
+          name: 'webhooks',
+        },
+      })
+
+      expect(response.statusCode).toBe(400)
+      expect(response.json()).toEqual({
+        message: 'Queue overflow restore is not supported on OrioleDB',
+      })
+    } finally {
+      await app.close()
+    }
+  })
 })

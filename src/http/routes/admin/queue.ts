@@ -12,7 +12,7 @@ import { FromSchema } from 'json-schema-to-ts'
 import { getConfig } from '../../../config'
 import { registerApiKeyAuth } from '../../plugins/apikey'
 
-const { pgQueueEnable } = getConfig()
+const { databaseEngine, pgQueueEnable } = getConfig()
 
 function getQueueOverflowStore() {
   return new QueueOverflowStorePg(Queue.getDb())
@@ -243,6 +243,12 @@ export default async function routes(fastify: FastifyInstance) {
     async (req, reply) => {
       if (!pgQueueEnable) {
         return reply.status(400).send({ message: 'Queue is not enabled' })
+      }
+
+      if (databaseEngine === 'oriole') {
+        return reply
+          .status(400)
+          .send({ message: 'Queue overflow restore is not supported on OrioleDB' })
       }
 
       const store = getQueueOverflowStore()
