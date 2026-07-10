@@ -7,6 +7,7 @@ const CONFIG_ENV_KEYS = [
   'TENANT_POOL_CACHE_HIT_LOG_SAMPLE_RATE',
   'TENANT_POOL_CACHE_MISS_LOG_SAMPLE_RATE',
   'DATABASE_POOL_DRAIN_TIMEOUT',
+  'DATABASE_ENGINE',
   'REQUEST_HARD_LIMITS_ENABLED',
   'STORAGE_S3_REQUEST_CHECKSUM_CALCULATION',
   'STORAGE_S3_RESPONSE_CHECKSUM_VALIDATION',
@@ -60,6 +61,19 @@ describe('tenant pool cache config parsing', () => {
     expect(config.tenantPoolCacheMissLogSampleRate).toBe(0)
     expect(config.databasePoolDrainTimeout).toBe(30_000)
     expect(config.requestHardLimitsEnabled).toBe(false)
+  })
+
+  test.each([
+    'postgres',
+    'oriole',
+    'multigres',
+  ] as const)('parses the %s database engine', async (databaseEngine) => {
+    setConfigEnv({ DATABASE_ENGINE: databaseEngine })
+
+    const { getConfig } = await import('./config')
+    const config = getConfig({ reload: true })
+
+    expect(config.databaseEngine).toBe(databaseEngine)
   })
 
   test('parses request hard limits as disabled by default', async () => {

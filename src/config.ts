@@ -5,7 +5,7 @@ import { SignJWT } from 'jose'
 export type StorageBackendType = 'file' | 's3'
 export type VectorBucketProvider = 's3' | 'pgvector'
 export type IcebergCatalogAuthType = 'sigv4' | 'token'
-export type DatabaseEngine = 'postgres' | 'multigres'
+export type DatabaseEngine = 'postgres' | 'oriole' | 'multigres'
 export type StorageS3ChecksumConfig = 'WHEN_SUPPORTED' | 'WHEN_REQUIRED'
 const DEFAULT_S3_UPLOAD_PART_SIZE = 16 * 1024 * 1024
 const MIN_S3_UPLOAD_PART_SIZE = 5 * 1024 * 1024
@@ -256,11 +256,13 @@ export function normalizeDatabaseEngine(engine: string | null | undefined): Data
     return 'postgres'
   }
 
-  if (engine === 'postgres' || engine === 'multigres') {
+  if (engine === 'postgres' || engine === 'oriole' || engine === 'multigres') {
     return engine
   }
 
-  throw new Error(`Invalid database engine "${engine}". Expected "postgres" or "multigres".`)
+  throw new Error(
+    `Invalid database engine "${engine}". Expected "postgres", "oriole", or "multigres".`
+  )
 }
 
 function normalizeStorageS3ChecksumConfig(
