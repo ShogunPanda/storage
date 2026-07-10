@@ -3,7 +3,7 @@ import {
   buildJobsCountRequest,
   buildJobsRequest,
   main,
-  parseJobsConfig,
+  parseJobsOptions,
   resolveJobsAdminUrl,
 } from './jobs-client'
 
@@ -20,16 +20,9 @@ describe('resolveJobsAdminUrl', () => {
   })
 })
 
-describe('parseJobsConfig', () => {
+describe('parseJobsOptions', () => {
   it('uses defaults when optional env is omitted', () => {
-    expect(
-      parseJobsConfig({
-        ADMIN_URL: 'http://localhost:54321/admin',
-        ADMIN_API_KEY: 'test-key',
-      })
-    ).toEqual({
-      adminApiKey: 'test-key',
-      adminUrl: 'http://localhost:54321/admin',
+    expect(parseJobsOptions({})).toEqual({
       confirmAll: undefined,
       queueName: undefined,
       eventTypes: undefined,
@@ -44,25 +37,19 @@ describe('parseJobsConfig', () => {
 
   it('rejects invalid JOBS_SOURCE and JOBS_LIMIT values', () => {
     expect(
-      parseJobsConfig({
-        ADMIN_URL: 'http://localhost:54321/admin',
-        ADMIN_API_KEY: 'test-key',
+      parseJobsOptions({
         JOBS_SOURCE: 'archive',
       })
     ).toBe('JOBS_SOURCE must be either job or backup')
 
     expect(
-      parseJobsConfig({
-        ADMIN_URL: 'http://localhost:54321/admin',
-        ADMIN_API_KEY: 'test-key',
+      parseJobsOptions({
         JOBS_LIMIT: '0',
       })
     ).toBe('JOBS_LIMIT must be a positive integer')
 
     expect(
-      parseJobsConfig({
-        ADMIN_URL: 'http://localhost:54321/admin',
-        ADMIN_API_KEY: 'test-key',
+      parseJobsOptions({
         JOBS_BACKUP_CONFIRM_ALL: 'yes',
       })
     ).toBe('JOBS_BACKUP_CONFIRM_ALL must be either true or false')
@@ -70,9 +57,7 @@ describe('parseJobsConfig', () => {
 
   it('parses backlog and sleep settings', () => {
     expect(
-      parseJobsConfig({
-        ADMIN_URL: 'http://localhost:54321/admin',
-        ADMIN_API_KEY: 'test-key',
+      parseJobsOptions({
         JOBS_MAX_PENDING: '12345',
         JOBS_SLEEP_MS: '25',
       })
@@ -81,17 +66,13 @@ describe('parseJobsConfig', () => {
 
   it('rejects invalid backlog and sleep settings', () => {
     expect(
-      parseJobsConfig({
-        ADMIN_URL: 'http://localhost:54321/admin',
-        ADMIN_API_KEY: 'test-key',
+      parseJobsOptions({
         JOBS_MAX_PENDING: '0',
       })
     ).toBe('JOBS_MAX_PENDING must be a positive integer')
 
     expect(
-      parseJobsConfig({
-        ADMIN_URL: 'http://localhost:54321/admin',
-        ADMIN_API_KEY: 'test-key',
+      parseJobsOptions({
         JOBS_SLEEP_MS: 'later',
       })
     ).toBe('JOBS_SLEEP_MS must be a positive integer')
@@ -196,9 +177,43 @@ describe('main', () => {
     expect(console.error).toHaveBeenCalledWith('Please provide an action: list, backup, or restore')
   })
 
+  it.each([
+    [{}, 'Please provide ADMIN_URL'],
+    [{ ADMIN_URL: 'http://localhost:54321/admin' }, 'Please provide ADMIN_API_KEY'],
+  ])('reports missing admin configuration', async (env, message) => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await expect(main(env, ['node', 'jobs-client.ts', 'list'])).resolves.toBe(false)
+
+    expect(process.exitCode).toBe(1)
+    expect(errorSpy).toHaveBeenCalledWith(message)
+  })
+
+  it('reports option validation errors without logging credentials', async () => {
+    const adminApiKey = 'super-secret-admin-key'
+    const fetchMock = vi.fn<typeof fetch>()
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await expect(
+      main(
+        {
+          ADMIN_URL: 'http://localhost:54321/admin',
+          ADMIN_API_KEY: adminApiKey,
+          JOBS_LIMIT: '0',
+        },
+        ['node', 'jobs-client.ts', 'list'],
+        { fetch: fetchMock }
+      )
+    ).resolves.toBe(false)
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(errorSpy).toHaveBeenCalledWith('JOBS_LIMIT must be a positive integer')
+    expect(errorSpy.mock.calls.flat().join(' ')).not.toContain(adminApiKey)
+  })
+
   it('refuses a bare backup before making a request', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
-    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     await expect(
       main(
@@ -212,6 +227,9 @@ describe('main', () => {
 
     expect(fetchSpy).not.toHaveBeenCalled()
     expect(process.exitCode).toBe(1)
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Backup requires JOBS_QUEUE_NAME, JOBS_EVENT_TYPES, or JOBS_TENANT_REFS unless JOBS_BACKUP_CONFIRM_ALL=true'
+    )
   })
 
   it('prints the JSON response for successful single-shot requests', async () => {
@@ -237,6 +255,68 @@ describe('main', () => {
     ).resolves.toBe(true)
 
     expect(console.log).toHaveBeenCalledWith('{\n  "totalCount": 3\n}')
+  })
+
+  it('does not log authenticated response bodies', async () => {
+    const adminApiKey = 'super-secret-admin-key'
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ message: `request failed for ${adminApiKey}` }), {
+        status: 500,
+        statusText: `Internal Server Error for ${adminApiKey}`,
+      })
+    )
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    await expect(
+      main(
+        {
+          ADMIN_URL: 'http://localhost:54321/admin',
+          ADMIN_API_KEY: adminApiKey,
+          JOBS_QUEUE_NAME: 'webhooks',
+        },
+        ['node', 'jobs-client.ts', 'list'],
+        { fetch: fetchMock }
+      )
+    ).resolves.toBe(false)
+
+    expect(process.exitCode).toBe(1)
+    expect(errorSpy).toHaveBeenCalledOnce()
+    expect(errorSpy).toHaveBeenCalledWith('Jobs client request failed')
+    expect(errorSpy.mock.calls.flat().join(' ')).not.toContain(adminApiKey)
+    expect(logSpy).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    'error',
+    'string',
+  ] as const)('does not log %s fetch error details', async (rejectionType) => {
+    const adminApiKey = 'super-secret-admin-key'
+    const rejection =
+      rejectionType === 'error'
+        ? new Error(`request with ApiKey ${adminApiKey} failed`)
+        : `request with ApiKey ${adminApiKey} failed`
+    const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(rejection)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    await expect(
+      main(
+        {
+          ADMIN_URL: 'http://localhost:54321/admin',
+          ADMIN_API_KEY: adminApiKey,
+          JOBS_QUEUE_NAME: 'webhooks',
+        },
+        ['node', 'jobs-client.ts', 'list'],
+        { fetch: fetchMock }
+      )
+    ).resolves.toBe(false)
+
+    expect(process.exitCode).toBe(1)
+    expect(errorSpy).toHaveBeenCalledOnce()
+    expect(errorSpy).toHaveBeenCalledWith('Jobs client request failed')
+    expect(errorSpy.mock.calls.flat().join(' ')).not.toContain(adminApiKey)
+    expect(logSpy).not.toHaveBeenCalled()
   })
 
   it('waits while the global created backlog is above the threshold', async () => {

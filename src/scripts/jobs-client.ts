@@ -8,9 +8,7 @@ type JobsAction = 'backup' | 'list' | 'restore'
 type JobsGroupBy = 'summary' | 'tenant'
 type JobsSource = 'backup' | 'job'
 
-interface JobsClientConfig {
-  adminApiKey: string
-  adminUrl: string
+interface JobsClientOptions {
   confirmAll?: boolean
   eventTypes?: string[]
   groupBy: JobsGroupBy
@@ -22,6 +20,11 @@ interface JobsClientConfig {
   tenantRefs?: string[]
 }
 
+interface JobsClientConfig extends JobsClientOptions {
+  adminApiKey: string
+  adminUrl: string
+}
+
 interface JobsClientDependencies {
   fetch?: typeof fetch
   sleep?: (ms: number) => Promise<void>
@@ -30,6 +33,11 @@ interface JobsClientDependencies {
 const JOBS_MAX_PENDING_DEFAULT = 50_000
 const JOBS_SLEEP_MS_DEFAULT = 1_000
 const JOBS_BACKOFF_MAX_MS = 60_000
+const JOBS_CLIENT_REQUEST_FAILURE_MESSAGE = 'Jobs client request failed'
+const JOBS_BACKUP_SCOPE_MESSAGE =
+  'Backup requires JOBS_QUEUE_NAME, JOBS_EVENT_TYPES, or JOBS_TENANT_REFS unless JOBS_BACKUP_CONFIRM_ALL=true'
+
+class UnscopedBackupError extends Error {}
 
 export function resolveJobsAdminUrl(
   baseUrl: string,
@@ -47,17 +55,9 @@ export function resolveJobsAdminUrl(
   return url
 }
 
-export function parseJobsConfig(env: NodeJS.ProcessEnv): JobsClientConfig | string {
+export function parseJobsOptions(env: NodeJS.ProcessEnv): JobsClientOptions | string {
   const source = (env.JOBS_SOURCE?.trim() || 'job') as JobsSource
   const groupBy = (env.JOBS_GROUP_BY?.trim() || 'summary') as JobsGroupBy
-
-  if (!env.ADMIN_URL) {
-    return 'Please provide ADMIN_URL'
-  }
-
-  if (!env.ADMIN_API_KEY) {
-    return 'Please provide ADMIN_API_KEY'
-  }
 
   if (source !== 'job' && source !== 'backup') {
     return 'JOBS_SOURCE must be either job or backup'
@@ -69,8 +69,6 @@ export function parseJobsConfig(env: NodeJS.ProcessEnv): JobsClientConfig | stri
 
   try {
     return {
-      adminApiKey: env.ADMIN_API_KEY,
-      adminUrl: env.ADMIN_URL,
       confirmAll: parseOptionalBoolean(
         env.JOBS_BACKUP_CONFIRM_ALL,
         'JOBS_BACKUP_CONFIRM_ALL must be either true or false'
@@ -123,9 +121,7 @@ export function buildJobsRequest(action: JobsAction, config: JobsClientConfig) {
     !config.eventTypes?.length &&
     !config.tenantRefs?.length
   ) {
-    throw new Error(
-      'Backup requires JOBS_QUEUE_NAME, JOBS_EVENT_TYPES, or JOBS_TENANT_REFS unless JOBS_BACKUP_CONFIRM_ALL=true'
-    )
+    throw new UnscopedBackupError(JOBS_BACKUP_SCOPE_MESSAGE)
   }
 
   headers.set('Content-Type', 'application/json')
@@ -157,15 +153,13 @@ export function buildJobsCountRequest(config: JobsClientConfig) {
   }
 }
 
-async function assertJsonResponse(response: Response, context: string) {
+async function assertJsonResponse(response: Response) {
   if (response.ok) {
     return response.json()
   }
 
-  const body = await response.text()
-  const details = body ? `: ${body}` : ''
-
-  throw new Error(`${context} failed with ${response.status} ${response.statusText}${details}`)
+  await response.text()
+  throw new Error(JOBS_CLIENT_REQUEST_FAILURE_MESSAGE)
 }
 
 function fail(message: string) {
@@ -195,10 +189,22 @@ export async function main(
     return fail('Please provide an action: list, backup, or restore')
   }
 
-  const config = parseJobsConfig(env)
-  if (typeof config === 'string') {
-    return fail(config)
+  const adminUrl = env.ADMIN_URL
+  if (!adminUrl) {
+    return fail('Please provide ADMIN_URL')
   }
+
+  const adminApiKey = env.ADMIN_API_KEY
+  if (!adminApiKey) {
+    return fail('Please provide ADMIN_API_KEY')
+  }
+
+  const options = parseJobsOptions(env)
+  if (typeof options === 'string') {
+    return fail(options)
+  }
+
+  const config: JobsClientConfig = { ...options, adminApiKey, adminUrl }
 
   try {
     const fetchRequest = dependencies.fetch ?? globalThis.fetch
@@ -218,10 +224,7 @@ export async function main(
             method: backlogRequest.method,
             headers: backlogRequest.headers,
           })
-          const backlog = (await assertJsonResponse(
-            backlogResponse,
-            `COUNT ${backlogRequest.url}`
-          )) as { totalCount: number }
+          const backlog = (await assertJsonResponse(backlogResponse)) as { totalCount: number }
 
           if (backlog.totalCount <= config.maxPending) {
             break
@@ -239,7 +242,7 @@ export async function main(
           headers: restoreRequest.headers,
           body: restoreRequest.body,
         })
-        const data = (await assertJsonResponse(response, `RESTORE ${restoreRequest.url}`)) as {
+        const data = (await assertJsonResponse(response)) as {
           conflictCount: number
           hasMore: boolean
           movedCount: number
@@ -254,7 +257,7 @@ export async function main(
         )
 
         if (data.hasMore && data.movedCount + data.conflictCount === 0) {
-          throw new Error('Restore reported hasMore=true without moving or dropping any rows')
+          return fail('Restore reported hasMore=true without moving or dropping any rows')
         }
 
         if (!data.hasMore) {
@@ -275,17 +278,21 @@ export async function main(
       body: request.body,
     })
 
-    const data = await assertJsonResponse(response, `${action.toUpperCase()} ${request.url}`)
+    const data = await assertJsonResponse(response)
     console.log(JSON.stringify(data, null, 2))
     return true
   } catch (error) {
-    return fail(error instanceof Error ? error.message : String(error))
+    if (error instanceof UnscopedBackupError) {
+      return fail(JOBS_BACKUP_SCOPE_MESSAGE)
+    }
+
+    return fail(JOBS_CLIENT_REQUEST_FAILURE_MESSAGE)
   }
 }
 
 if (require.main === module) {
-  main(process.env).catch((error) => {
+  main(process.env).catch(() => {
     process.exitCode = 1
-    console.error(error)
+    console.error(JOBS_CLIENT_REQUEST_FAILURE_MESSAGE)
   })
 }
