@@ -2,6 +2,7 @@ import { fetchPprofStream } from '@internal/monitoring/pprof/client-http'
 import { writePprofCaptureToFile } from '@internal/monitoring/pprof/download'
 import { generateFlameArtifacts, resolveFlameMdFormat } from '@internal/monitoring/pprof/flame'
 import type { PprofRequestTargetType } from '@internal/monitoring/pprof/types'
+import { parseNonNegativeInteger, parsePositiveInteger } from '@internal/parser'
 import path from 'path'
 
 const ADMIN_URL = process.env.ADMIN_URL
@@ -41,21 +42,6 @@ export function parseBooleanEnvWithDefault(value: string | undefined, defaultVal
   return parseBooleanEnv(value) === true
 }
 
-function parseUnsignedInteger(value: string, errorMessage: string) {
-  const normalized = value.trim()
-
-  if (!/^\d+$/.test(normalized)) {
-    throw new Error(errorMessage)
-  }
-
-  const parsed = Number.parseInt(normalized, 10)
-  if (!Number.isSafeInteger(parsed)) {
-    throw new Error(errorMessage)
-  }
-
-  return parsed
-}
-
 export function parsePositiveIntegerEnv(
   value: string | undefined,
   envName: string,
@@ -65,12 +51,7 @@ export function parsePositiveIntegerEnv(
     return defaultValue
   }
 
-  const parsed = parseUnsignedInteger(value, `${envName} must be a positive integer`)
-  if (parsed <= 0) {
-    throw new Error(`${envName} must be a positive integer`)
-  }
-
-  return parsed
+  return parsePositiveInteger(value, `${envName} must be a positive integer`)
 }
 
 export function parseNonNegativeIntegerEnv(value: string | undefined, envName: string) {
@@ -78,7 +59,7 @@ export function parseNonNegativeIntegerEnv(value: string | undefined, envName: s
     return undefined
   }
 
-  return parseUnsignedInteger(value, `${envName} must be a non-negative integer`)
+  return parseNonNegativeInteger(value, `${envName} must be a non-negative integer`)
 }
 
 export function parsePprofTarget(
@@ -116,10 +97,7 @@ export function parsePprofTarget(
     }
   }
 
-  const seconds = parseUnsignedInteger(secondsValue, 'seconds must be a positive integer')
-  if (seconds <= 0) {
-    throw new Error('seconds must be a positive integer')
-  }
+  const seconds = parsePositiveInteger(secondsValue, 'seconds must be a positive integer')
 
   return {
     seconds,

@@ -1,0 +1,291 @@
+import {
+  parseCommaSeparatedList,
+  parseOptionalBoolean,
+  parsePositiveInteger,
+} from '@internal/parser'
+
+type JobsAction = 'backup' | 'list' | 'restore'
+type JobsGroupBy = 'summary' | 'tenant'
+type JobsSource = 'backup' | 'job'
+
+interface JobsClientConfig {
+  adminApiKey: string
+  adminUrl: string
+  confirmAll?: boolean
+  eventTypes?: string[]
+  groupBy: JobsGroupBy
+  limit?: number
+  maxPending: number
+  queueName?: string
+  sleepMs: number
+  source: JobsSource
+  tenantRefs?: string[]
+}
+
+interface JobsClientDependencies {
+  fetch?: typeof fetch
+  sleep?: (ms: number) => Promise<void>
+}
+
+const JOBS_MAX_PENDING_DEFAULT = 50_000
+const JOBS_SLEEP_MS_DEFAULT = 1_000
+const JOBS_BACKOFF_MAX_MS = 60_000
+
+export function resolveJobsAdminUrl(
+  baseUrl: string,
+  requestPath: string,
+  query?: Record<string, string | undefined>
+) {
+  const url = new URL(`${baseUrl.replace(/\/+$/, '')}/${requestPath.replace(/^\/+/, '')}`)
+
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value !== undefined) {
+      url.searchParams.set(key, value)
+    }
+  }
+
+  return url
+}
+
+export function parseJobsConfig(env: NodeJS.ProcessEnv): JobsClientConfig | string {
+  const source = (env.JOBS_SOURCE?.trim() || 'job') as JobsSource
+  const groupBy = (env.JOBS_GROUP_BY?.trim() || 'summary') as JobsGroupBy
+
+  if (!env.ADMIN_URL) {
+    return 'Please provide ADMIN_URL'
+  }
+
+  if (!env.ADMIN_API_KEY) {
+    return 'Please provide ADMIN_API_KEY'
+  }
+
+  if (source !== 'job' && source !== 'backup') {
+    return 'JOBS_SOURCE must be either job or backup'
+  }
+
+  if (groupBy !== 'summary' && groupBy !== 'tenant') {
+    return 'JOBS_GROUP_BY must be either summary or tenant'
+  }
+
+  try {
+    return {
+      adminApiKey: env.ADMIN_API_KEY,
+      adminUrl: env.ADMIN_URL,
+      confirmAll: parseOptionalBoolean(
+        env.JOBS_BACKUP_CONFIRM_ALL,
+        'JOBS_BACKUP_CONFIRM_ALL must be either true or false'
+      ),
+      queueName: env.JOBS_QUEUE_NAME?.trim() || undefined,
+      eventTypes: parseCommaSeparatedList(env.JOBS_EVENT_TYPES),
+      tenantRefs: parseCommaSeparatedList(env.JOBS_TENANT_REFS),
+      source,
+      groupBy,
+      limit: env.JOBS_LIMIT
+        ? parsePositiveInteger(env.JOBS_LIMIT, 'JOBS_LIMIT must be a positive integer')
+        : undefined,
+      maxPending: env.JOBS_MAX_PENDING
+        ? parsePositiveInteger(env.JOBS_MAX_PENDING, 'JOBS_MAX_PENDING must be a positive integer')
+        : JOBS_MAX_PENDING_DEFAULT,
+      sleepMs: env.JOBS_SLEEP_MS
+        ? parsePositiveInteger(env.JOBS_SLEEP_MS, 'JOBS_SLEEP_MS must be a positive integer')
+        : JOBS_SLEEP_MS_DEFAULT,
+    }
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
+  }
+}
+
+export function buildJobsRequest(action: JobsAction, config: JobsClientConfig) {
+  const headers = new Headers({
+    ApiKey: config.adminApiKey,
+  })
+
+  if (action === 'list') {
+    return {
+      method: 'GET',
+      url: resolveJobsAdminUrl(config.adminUrl, '/queue/overflow', {
+        source: config.source,
+        groupBy: config.groupBy,
+        name: config.queueName,
+        eventTypes: config.eventTypes?.join(','),
+        tenantRefs: config.tenantRefs?.join(','),
+        limit: config.limit?.toString(),
+      }),
+      headers,
+      body: undefined,
+    }
+  }
+
+  if (
+    action === 'backup' &&
+    !config.confirmAll &&
+    !config.queueName &&
+    !config.eventTypes?.length &&
+    !config.tenantRefs?.length
+  ) {
+    throw new Error(
+      'Backup requires JOBS_QUEUE_NAME, JOBS_EVENT_TYPES, or JOBS_TENANT_REFS unless JOBS_BACKUP_CONFIRM_ALL=true'
+    )
+  }
+
+  headers.set('Content-Type', 'application/json')
+
+  return {
+    method: 'POST',
+    url: resolveJobsAdminUrl(
+      config.adminUrl,
+      action === 'backup' ? '/queue/overflow/backup' : '/queue/overflow/restore'
+    ),
+    headers,
+    body: JSON.stringify({
+      name: config.queueName,
+      eventTypes: config.eventTypes,
+      tenantRefs: config.tenantRefs,
+      limit: config.limit,
+      ...(action === 'backup' && config.confirmAll ? { confirmAll: true } : {}),
+    }),
+  }
+}
+
+export function buildJobsCountRequest(config: JobsClientConfig) {
+  return {
+    method: 'GET',
+    url: resolveJobsAdminUrl(config.adminUrl, '/queue/overflow/count'),
+    headers: new Headers({
+      ApiKey: config.adminApiKey,
+    }),
+  }
+}
+
+async function assertJsonResponse(response: Response, context: string) {
+  if (response.ok) {
+    return response.json()
+  }
+
+  const body = await response.text()
+  const details = body ? `: ${body}` : ''
+
+  throw new Error(`${context} failed with ${response.status} ${response.statusText}${details}`)
+}
+
+function fail(message: string) {
+  process.exitCode = 1
+  console.error(message)
+  return false
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+function formatWait(ms: number) {
+  return ms % 1_000 === 0 ? `${ms / 1_000}s` : `${ms}ms`
+}
+
+export async function main(
+  env: NodeJS.ProcessEnv = process.env,
+  argv: string[] = process.argv,
+  dependencies: JobsClientDependencies = {}
+): Promise<boolean> {
+  const action = argv[2]
+
+  if (action !== 'list' && action !== 'backup' && action !== 'restore') {
+    return fail('Please provide an action: list, backup, or restore')
+  }
+
+  const config = parseJobsConfig(env)
+  if (typeof config === 'string') {
+    return fail(config)
+  }
+
+  try {
+    const fetchRequest = dependencies.fetch ?? globalThis.fetch
+
+    if (action === 'restore') {
+      const wait = dependencies.sleep ?? sleep
+      const restoreRequest = buildJobsRequest(action, config)
+      const backlogRequest = buildJobsCountRequest(config)
+      let backoffMs = Math.min(config.sleepMs, JOBS_BACKOFF_MAX_MS)
+      let batches = 0
+      let conflictCount = 0
+      let movedCount = 0
+
+      while (true) {
+        while (true) {
+          const backlogResponse = await fetchRequest(backlogRequest.url, {
+            method: backlogRequest.method,
+            headers: backlogRequest.headers,
+          })
+          const backlog = (await assertJsonResponse(
+            backlogResponse,
+            `COUNT ${backlogRequest.url}`
+          )) as { totalCount: number }
+
+          if (backlog.totalCount <= config.maxPending) {
+            break
+          }
+
+          console.error(
+            `Queue backlog ${backlog.totalCount} above ${config.maxPending}, waiting ${formatWait(backoffMs)}`
+          )
+          await wait(backoffMs)
+          backoffMs = Math.min(backoffMs * 2, JOBS_BACKOFF_MAX_MS)
+        }
+
+        const response = await fetchRequest(restoreRequest.url, {
+          method: restoreRequest.method,
+          headers: restoreRequest.headers,
+          body: restoreRequest.body,
+        })
+        const data = (await assertJsonResponse(response, `RESTORE ${restoreRequest.url}`)) as {
+          conflictCount: number
+          hasMore: boolean
+          movedCount: number
+        }
+
+        batches += 1
+        conflictCount += data.conflictCount
+        movedCount += data.movedCount
+        backoffMs = Math.min(config.sleepMs, JOBS_BACKOFF_MAX_MS)
+        console.error(
+          `Restore batch ${batches}: moved ${data.movedCount}, conflicts ${data.conflictCount}`
+        )
+
+        if (data.hasMore && data.movedCount + data.conflictCount === 0) {
+          throw new Error('Restore reported hasMore=true without moving or dropping any rows')
+        }
+
+        if (!data.hasMore) {
+          break
+        }
+
+        await wait(config.sleepMs)
+      }
+
+      console.log(JSON.stringify({ batches, conflictCount, movedCount }, null, 2))
+      return true
+    }
+
+    const request = buildJobsRequest(action, config)
+    const response = await fetchRequest(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: request.body,
+    })
+
+    const data = await assertJsonResponse(response, `${action.toUpperCase()} ${request.url}`)
+    console.log(JSON.stringify(data, null, 2))
+    return true
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error))
+  }
+}
+
+if (require.main === module) {
+  main(process.env).catch((error) => {
+    process.exitCode = 1
+    console.error(error)
+  })
+}

@@ -19,7 +19,8 @@ describe('admin queue routes', () => {
   it('passes sbReqId to the move jobs task', async () => {
     vi.resetModules()
 
-    const { mergeConfig } = await import('../../../config')
+    const { getConfig, mergeConfig } = await import('../../../config')
+    getConfig()
     mergeConfig({
       pgQueueEnable: true,
       adminApiKeys: 'test-admin-key',
@@ -71,7 +72,8 @@ describe('admin queue routes', () => {
   it('rejects move jobs requests without queue names', async () => {
     vi.resetModules()
 
-    const { mergeConfig } = await import('../../../config')
+    const { getConfig, mergeConfig } = await import('../../../config')
+    getConfig()
     mergeConfig({
       pgQueueEnable: true,
       adminApiKeys: 'test-admin-key',

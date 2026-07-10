@@ -48,7 +48,7 @@ interface PgTransactionOptions {
   statementTimeoutMs?: number
 }
 
-type PgBeginTransactionOptions = TransactionOptions & PgTransactionOptions
+export type PgBeginTransactionOptions = TransactionOptions & PgTransactionOptions & PgQueryOptions
 
 const defaultStatementTimeoutMs = normalizeStatementTimeoutMs(databaseStatementTimeout)
 
@@ -438,9 +438,12 @@ export class PgPoolExecutor implements PgTransactionalExecutor {
   }
 
   async beginTransaction(options?: PgBeginTransactionOptions): Promise<PgTransaction> {
+    const signal = options?.signal
     let client: PoolClient
     try {
-      client = await this.pool.connect()
+      client = signal
+        ? await acquirePoolClientWithSignal(this.pool, signal)
+        : await this.pool.connect()
     } catch (e) {
       if (isConnectionTimeoutError(e)) {
         throw ERRORS.DatabaseTimeout(e)
@@ -455,7 +458,7 @@ export class PgPoolExecutor implements PgTransactionalExecutor {
     })
 
     try {
-      await transaction.runSetupQuery(buildBeginStatement(options))
+      await transaction.runSetupQuery(buildBeginStatement(options), signal ? { signal } : undefined)
       return transaction
     } catch (e) {
       if (!transaction.isCompleted()) {
@@ -833,6 +836,62 @@ export function createAbortError(): Error & { code: string } {
   error.name = 'AbortError'
   error.code = 'ABORT_ERR'
   return error
+}
+
+function acquirePoolClientWithSignal(pool: Pool, signal: AbortSignal): Promise<PoolClient> {
+  assertValidSignal(signal)
+
+  // pg-pool cannot remove a pending checkout. Reject the caller immediately,
+  // then release a client that arrives after the signal aborts.
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const cleanup = () => signal.removeEventListener('abort', onAbort)
+    const onAbort = () => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      cleanup()
+      reject(createAbortError())
+    }
+
+    signal.addEventListener('abort', onAbort, { once: true })
+
+    let acquisition: Promise<PoolClient>
+    try {
+      acquisition = pool.connect()
+    } catch (error) {
+      settled = true
+      cleanup()
+      reject(error)
+      return
+    }
+
+    void acquisition
+      .then(
+        (client) => {
+          if (settled) {
+            client.release()
+            return
+          }
+
+          settled = true
+          cleanup()
+          resolve(client)
+        },
+        (error) => {
+          if (settled) {
+            return
+          }
+
+          settled = true
+          cleanup()
+          reject(error)
+        }
+      )
+      .catch(() => undefined)
+  })
 }
 
 async function runPgQuery<T extends QueryResultRow = QueryResultRow>(
