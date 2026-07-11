@@ -2,7 +2,7 @@ import { fetchPprofStream } from '@internal/monitoring/pprof/client-http'
 import { writePprofCaptureToFile } from '@internal/monitoring/pprof/download'
 import { generateFlameArtifacts, resolveFlameMdFormat } from '@internal/monitoring/pprof/flame'
 import type { PprofRequestTargetType } from '@internal/monitoring/pprof/types'
-import { parseNonNegativeInteger, parsePositiveInteger } from '@internal/parser'
+import { parseNonNegativeInteger, parsePositiveInteger } from '@internal/strings'
 import path from 'path'
 
 const ADMIN_URL = process.env.ADMIN_URL

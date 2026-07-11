@@ -1,4 +1,3 @@
-import { parseCommaSeparatedList } from '@internal/parser'
 import { SYSTEM_TENANT } from '@internal/queue/constants'
 import {
   JOB_OVERFLOW_LIST_LIMIT_DEFAULT,
@@ -6,6 +5,7 @@ import {
   QueueOverflowStorePg,
 } from '@internal/queue/overflow'
 import { Queue } from '@internal/queue/queue'
+import { parseCommaSeparatedList } from '@internal/strings'
 import { MoveJobs } from '@storage/events'
 import { FastifyInstance, RequestGenericInterface } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'

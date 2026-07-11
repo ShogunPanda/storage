@@ -2,7 +2,7 @@ import {
   parseCommaSeparatedList,
   parseOptionalBoolean,
   parsePositiveInteger,
-} from '@internal/parser'
+} from '@internal/strings'
 
 type JobsAction = 'backup' | 'list' | 'restore'
 type JobsGroupBy = 'summary' | 'tenant'

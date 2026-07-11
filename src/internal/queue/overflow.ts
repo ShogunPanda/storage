@@ -1,4 +1,4 @@
-import { normalizeStringList } from '@internal/parser'
+import { normalizeStringList } from '@internal/strings'
 import type { QueryResultRow } from 'pg'
 import type { PgExecutor, PgTransaction, PgTransactionalExecutor } from '../database/pg-connection'
 import { quoteQualifiedIdentifier } from '../database/sql'
