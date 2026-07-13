@@ -1,126 +1,111 @@
-import { fetchPprofStream, resolvePprofAdminUrl } from './client-http'
+import {
+  downloadStoredProfile,
+  fetchPprofStream,
+  fetchStoredProfile,
+  fetchStoredProfiles,
+  resolvePprofAdminUrl,
+} from './client-http'
 
 async function readStream(stream: NodeJS.ReadableStream) {
   const chunks: Buffer[] = []
-
   for await (const chunk of stream as AsyncIterable<Buffer | string | Uint8Array>) {
-    if (typeof chunk === 'string') {
-      chunks.push(Buffer.from(chunk))
-      continue
-    }
-
     chunks.push(Buffer.from(chunk))
   }
-
   return Buffer.concat(chunks).toString('utf8')
 }
 
-describe('resolvePprofAdminUrl', () => {
-  it('preserves ADMIN_URL path prefixes when joining absolute-looking paths', () => {
+describe('pprof admin HTTP client', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('preserves ADMIN_URL path prefixes', () => {
     expect(
       resolvePprofAdminUrl('https://example.com/admin/internal', '/debug/pprof/profile', {
-        seconds: 60,
-        sourceMaps: false,
-      })
-    ).toBe('https://example.com/admin/internal/debug/pprof/profile?seconds=60&sourceMaps=false')
-
-    expect(
-      resolvePprofAdminUrl('https://example.com/admin/internal/', '/debug/pprof/heap', {
-        workerId: 7,
-      })
-    ).toBe('https://example.com/admin/internal/debug/pprof/heap?workerId=7')
-  })
-
-  it('drops pre-existing query params from ADMIN_URL before adding request params', () => {
-    expect(
-      resolvePprofAdminUrl('https://example.com/admin/internal?stale=1', '/debug/pprof/profile', {
         seconds: 60,
       })
     ).toBe('https://example.com/admin/internal/debug/pprof/profile?seconds=60')
   })
-})
 
-describe('fetchPprofStream', () => {
-  afterEach(() => {
-    vi.restoreAllMocks()
-    vi.unstubAllGlobals()
-  })
-
-  it('requests multipart pprof output with the existing headers and query params', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response('profile-data', {
-        headers: {
-          'content-type': 'multipart/mixed; boundary=pprof-test',
-        },
-      })
-    )
+  it('requests raw manual captures', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(
+        new Response('profile-data', { headers: { 'content-type': 'application/octet-stream' } })
+      )
     vi.stubGlobal('fetch', fetchMock)
 
     const response = await fetchPprofStream({
       adminUrl: 'https://example.com/admin',
       apiKey: 'secret',
-      nodeModulesSourceMaps: 'next,@next/next-server',
       seconds: 90,
-      sourceMaps: true,
       type: 'profile',
-      workerId: 0,
     })
 
     expect(fetchMock).toHaveBeenCalledWith(
-      'https://example.com/admin/debug/pprof/profile?nodeModulesSourceMaps=next%2C%40next%2Fnext-server&seconds=90&sourceMaps=true&workerId=0',
+      'https://example.com/admin/debug/pprof/profile?seconds=90',
       {
-        headers: {
-          Accept: 'multipart/mixed',
-          ApiKey: 'secret',
-        },
+        headers: { Accept: 'application/octet-stream', ApiKey: 'secret' },
         method: 'GET',
       }
     )
-    expect(response.contentType).toBe('multipart/mixed; boundary=pprof-test')
     expect(await readStream(response.stream)).toBe('profile-data')
   })
 
-  it('requests full heap snapshots as raw binary output without pprof query params', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response('{"snapshot":true}', {
-        headers: {
-          'content-disposition': 'attachment; filename="storage-worker-7.heapsnapshot"',
-          'content-type': 'application/octet-stream',
-        },
-      })
-    )
+  it('lists, reads and downloads stored profiles', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json({ profiles: [], cursor: 'next' }))
+      .mockResolvedValueOnce(
+        Response.json({ id: 'abc', class: 'auto', kind: 'cpu', service: 'api' })
+      )
+      .mockResolvedValueOnce(new Response('stored-profile'))
     vi.stubGlobal('fetch', fetchMock)
 
-    const response = await fetchPprofStream({
-      adminUrl: 'https://example.com/admin',
-      apiKey: 'secret',
-      type: 'heap-snapshot',
-      workerId: 7,
-    })
+    expect(
+      await fetchStoredProfiles({
+        adminUrl: 'https://example.com/admin',
+        apiKey: 'secret',
+        class: 'auto',
+        service: 'api',
+        kind: 'cpu',
+        date: '2026-07-13',
+        limit: 20,
+      })
+    ).toEqual({ profiles: [], cursor: 'next' })
+    expect(
+      await fetchStoredProfile({
+        adminUrl: 'https://example.com/admin',
+        apiKey: 'secret',
+        id: 'abc',
+      })
+    ).toEqual({ id: 'abc', class: 'auto', kind: 'cpu', service: 'api' })
+    expect(
+      await readStream(
+        (
+          await downloadStoredProfile({
+            adminUrl: 'https://example.com/admin',
+            apiKey: 'secret',
+            id: 'abc',
+          })
+        ).stream
+      )
+    ).toBe('stored-profile')
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      'https://example.com/admin/debug/pprof/heap-snapshot?workerId=7',
-      {
-        headers: {
-          Accept: 'application/octet-stream',
-          ApiKey: 'secret',
-        },
-        method: 'GET',
-      }
-    )
-    expect(response.contentDisposition).toBe('attachment; filename="storage-worker-7.heapsnapshot"')
-    expect(response.contentType).toBe('application/octet-stream')
-    expect(await readStream(response.stream)).toBe('{"snapshot":true}')
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'https://example.com/admin/debug/pprof/profiles?class=auto&service=api&kind=cpu&date=2026-07-13&limit=20',
+      'https://example.com/admin/debug/pprof/profiles/detail?id=abc',
+      'https://example.com/admin/debug/pprof/profiles/download?id=abc',
+    ])
   })
 
-  it('surfaces non-2xx responses with the response body', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response('upstream failure', {
-        status: 502,
-        statusText: 'Bad Gateway',
-      })
+  it('caps error response bodies', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(
+          new Response('x'.repeat(6000), { status: 502, statusText: 'Bad Gateway' })
+        )
     )
-    vi.stubGlobal('fetch', fetchMock)
 
     await expect(
       fetchPprofStream({
@@ -129,34 +114,31 @@ describe('fetchPprofStream', () => {
         seconds: 30,
         type: 'heap',
       })
-    ).rejects.toThrow('Failed to capture pprof profile: HTTP 502 Bad Gateway: upstream failure')
+    ).rejects.toThrow(/Pprof admin request failed: HTTP 502 Bad Gateway: .*\[truncated\]/)
   })
 
-  it('caps verbose non-2xx response bodies', async () => {
-    const noisyBody = 'x'.repeat(6000)
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(noisyBody, {
-        status: 502,
-        statusText: 'Bad Gateway',
-      })
+  it('cancels an error response whose first chunk exactly fills the limit', async () => {
+    const cancel = vi.fn()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(Buffer.alloc(4096, 'x'))
+        controller.enqueue(Buffer.from('more'))
+      },
+      cancel,
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>().mockResolvedValue(new Response(body, { status: 502 }))
     )
-    vi.stubGlobal('fetch', fetchMock)
 
-    let error: unknown
-
-    try {
-      await fetchPprofStream({
+    await expect(
+      fetchPprofStream({
         adminUrl: 'https://example.com/admin',
         apiKey: 'secret',
         seconds: 30,
         type: 'heap',
       })
-    } catch (caught) {
-      error = caught
-    }
-
-    expect(error).toBeInstanceOf(Error)
-    expect((error as Error).message).toContain('… [truncated]')
-    expect((error as Error).message.length).toBeLessThan(4300)
+    ).rejects.toThrow(/\[truncated\]/)
+    expect(cancel).toHaveBeenCalledOnce()
   })
 })

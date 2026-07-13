@@ -10,6 +10,21 @@ const CONFIG_ENV_KEYS = [
   'REQUEST_HARD_LIMITS_ENABLED',
   'STORAGE_S3_REQUEST_CHECKSUM_CALCULATION',
   'STORAGE_S3_RESPONSE_CHECKSUM_VALIDATION',
+  'GLOBAL_S3_BUCKET',
+  'STORAGE_S3_BUCKET',
+  'PROFILING_AUTOMATIC_ENABLED',
+  'PROFILING_S3_BUCKET',
+  'PROFILING_S3_REGION',
+  'PROFILING_S3_ENDPOINT',
+  'PROFILING_S3_FORCE_PATH_STYLE',
+  'PROFILING_CAPTURE_SECONDS',
+  'PROFILING_CPU_INTERVAL_MICROS',
+  'PROFILING_TRIGGER_ELU',
+  'PROFILING_TRIGGER_DELAY_P99_MS',
+  'PROFILING_SEVERE_ELU',
+  'PROFILING_SEVERE_DELAY_P99_MS',
+  'PROFILING_COOLDOWN_SECONDS',
+  'PROFILING_MAX_CAPTURES_PER_HOUR',
 ] as const
 
 type ConfigEnvKey = (typeof CONFIG_ENV_KEYS)[number]
@@ -60,6 +75,69 @@ describe('tenant pool cache config parsing', () => {
     expect(config.tenantPoolCacheMissLogSampleRate).toBe(0)
     expect(config.databasePoolDrainTimeout).toBe(30_000)
     expect(config.requestHardLimitsEnabled).toBe(false)
+  })
+
+  test('defaults automatic profiling to off with incident-safe thresholds', async () => {
+    setConfigEnv({})
+
+    const { getConfig } = await import('./config')
+    const config = getConfig({ reload: true })
+
+    expect(config.profilingAutomaticEnabled).toBe(false)
+    expect(config.profilingTriggerElu).toBe(0.55)
+    expect(config.profilingCaptureSeconds).toBe(30)
+  })
+
+  test.each([
+    ['PROFILING_CAPTURE_SECONDS', '0'],
+    ['PROFILING_CAPTURE_SECONDS', '301'],
+    ['PROFILING_CAPTURE_SECONDS', '1.5'],
+    ['PROFILING_CPU_INTERVAL_MICROS', '999'],
+    ['PROFILING_CPU_INTERVAL_MICROS', '1000001'],
+    ['PROFILING_CPU_INTERVAL_MICROS', '1.5'],
+  ] as const)('rejects unsafe profiling setting %s=%s', async (key, value) => {
+    setConfigEnv({ [key]: value })
+
+    const { getConfig } = await import('./config')
+    const config = getConfig({ reload: true })
+
+    expect(config.profilingCaptureSeconds).toBe(30)
+    expect(config.profilingCpuIntervalMicros).toBe(10_000)
+  })
+
+  test('accepts bounded profiling capture and sampling settings', async () => {
+    setConfigEnv({
+      PROFILING_CAPTURE_SECONDS: '300',
+      PROFILING_CPU_INTERVAL_MICROS: '1000',
+    })
+
+    const { getConfig } = await import('./config')
+    const config = getConfig({ reload: true })
+
+    expect(config.profilingCaptureSeconds).toBe(300)
+    expect(config.profilingCpuIntervalMicros).toBe(1_000)
+  })
+
+  test('preserves explicit zero profiling cooldown and capture budget', async () => {
+    setConfigEnv({
+      PROFILING_COOLDOWN_SECONDS: '0',
+      PROFILING_MAX_CAPTURES_PER_HOUR: '0',
+    })
+
+    const { getConfig } = await import('./config')
+    const config = getConfig({ reload: true })
+
+    expect(config.profilingCooldownSeconds).toBe(0)
+    expect(config.profilingMaxCapturesPerHour).toBe(0)
+  })
+
+  test('rejects using the normal data bucket for profiles', async () => {
+    setConfigEnv({ STORAGE_S3_BUCKET: 'data', PROFILING_S3_BUCKET: 'data' })
+
+    const { getConfig } = await import('./config')
+    expect(() => getConfig({ reload: true })).toThrow(
+      'PROFILING_S3_BUCKET must be different from the normal storage data bucket'
+    )
   })
 
   test('parses request hard limits as disabled by default', async () => {

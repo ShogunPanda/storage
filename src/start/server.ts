@@ -16,6 +16,7 @@ import {
   startAsyncMigrations,
 } from '@internal/database/migrations'
 import { logger, logSchema } from '@internal/monitoring'
+import { startAutomaticProfiling } from '@internal/monitoring/pprof/automatic'
 import { Queue, SYSTEM_TENANT } from '@internal/queue'
 import { PgShardStoreFactory, ShardCatalog } from '@internal/sharding'
 import { getGlobal } from '@platformatic/globals'
@@ -69,6 +70,8 @@ async function main() {
     icebergShards,
     numWorkers,
   } = getConfig()
+
+  startAutomaticProfiling({ service: 'api', signal: shutdownSignal.signal })
 
   // VECTOR_DATABASE_URL is only required when pgvector is actually going to
   // be used: single-tenant mode (it's the maintenance URL used to CREATE
