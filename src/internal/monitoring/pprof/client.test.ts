@@ -29,7 +29,7 @@ describe('pprof admin HTTP client', () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValue(
-        new Response('profile-data', { headers: { 'content-type': 'application/octet-stream' } })
+        new Response('profile-data', { headers: { 'content-type': 'application/gzip' } })
       )
     vi.stubGlobal('fetch', fetchMock)
 
@@ -43,11 +43,29 @@ describe('pprof admin HTTP client', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       'https://example.com/admin/debug/pprof/profile?seconds=90',
       {
-        headers: { Accept: 'application/octet-stream', ApiKey: 'secret' },
+        headers: { Accept: 'application/gzip', ApiKey: 'secret' },
         method: 'GET',
       }
     )
     expect(await readStream(response.stream)).toBe('profile-data')
+  })
+
+  it('requests JSON heap snapshots without a duration', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}'))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const response = await fetchPprofStream({
+      adminUrl: 'https://example.com/admin',
+      apiKey: 'secret',
+      type: 'heap-snapshot',
+    })
+
+    const url = 'https://example.com/admin/debug/pprof/heap-snapshot'
+    expect(fetchMock).toHaveBeenCalledWith(url, {
+      headers: { Accept: 'application/json', ApiKey: 'secret' },
+      method: 'GET',
+    })
+    expect(await readStream(response.stream)).toBe('{}')
   })
 
   it('lists, reads and downloads stored profiles', async () => {

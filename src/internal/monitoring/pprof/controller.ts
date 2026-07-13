@@ -82,8 +82,10 @@ class ProfileController {
         )
       )
       if (options.class === 'auto') {
+        // Automatic captures have no direct consumer; the upload is their durable result.
         await archive
       } else {
+        // Manual callers receive body directly, so S3 latency or failure must not delay the response.
         void archive.catch((error) => {
           logSchema.error(logger, '[Profiling] manual profile archival failed', {
             type: 'profiling',

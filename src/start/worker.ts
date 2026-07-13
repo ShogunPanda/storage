@@ -41,7 +41,7 @@ export async function main() {
   const { requestTraceHeader, adminPort, host } = getConfig()
 
   logger.info('[Queue] Starting Queue Worker')
-  startAutomaticProfiling({ service: 'worker', signal: shutdownSignal.signal })
+  await startAutomaticProfiling({ service: 'worker', signal: shutdownSignal.signal })
 
   await listenForTenantUpdate(PubSub)
 

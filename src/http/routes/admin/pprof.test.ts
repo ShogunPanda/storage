@@ -64,8 +64,29 @@ describe('admin pprof routes', () => {
 
     expect(response.statusCode).toBe(200)
     expect(response.body).toBe('profile')
+    expect(response.headers['content-type']).toBe('application/gzip')
+    expect(response.headers['content-disposition']).toMatch(
+      /^attachment; filename="cpu-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.pprof\.gz"$/
+    )
     expect(mocks.capture).toHaveBeenCalledWith(
       expect.objectContaining({ class: 'manual', kind: 'cpu', reason: 'admin', seconds: 30 })
+    )
+    await fastify.close()
+  })
+
+  it('uses a portable filename for heap snapshots', async () => {
+    mocks.heapSnapshot.mockReturnValue(Buffer.from('{}'))
+    const fastify = await app()
+    const response = await fastify.inject({
+      method: 'GET',
+      url: '/debug/pprof/heap-snapshot',
+      headers: { apikey: 'secret' },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.headers['content-type']).toBe('application/json')
+    expect(response.headers['content-disposition']).toMatch(
+      /^attachment; filename="heap-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.heapsnapshot"$/
     )
     await fastify.close()
   })

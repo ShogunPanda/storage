@@ -27,10 +27,14 @@ const profileIdQuery = {
   additionalProperties: false,
 } as const
 
+function filenameTimestamp(date = new Date()) {
+  return date.toISOString().replace(/[:.]/g, '-')
+}
+
 function captureHeaders(kind: ProfileKind) {
   return {
-    'content-type': 'application/octet-stream',
-    'content-disposition': `attachment; filename="${kind}-${new Date().toISOString()}.pprof.gz"`,
+    'content-type': 'application/gzip',
+    'content-disposition': `attachment; filename="${kind}-${filenameTimestamp()}.pprof.gz"`,
   }
 }
 
@@ -89,7 +93,7 @@ export default async function routes(fastify: FastifyInstance) {
         .header('content-type', 'application/json')
         .header(
           'content-disposition',
-          `attachment; filename="heap-${new Date().toISOString()}.heapsnapshot"`
+          `attachment; filename="heap-${filenameTimestamp()}.heapsnapshot"`
         )
         .send(profileController.heapSnapshot(signal))
     } catch (error) {
@@ -167,7 +171,7 @@ export default async function routes(fastify: FastifyInstance) {
       try {
         const { id } = request.query as { id: string }
         const { object, profile } = await getProfileStore().get(id)
-        const filename = `${profile.class}-${profile.service}-${profile.kind}-${profile.startedAt.toISOString().replace(/[:.]/g, '-')}.pprof.gz`
+        const filename = `${profile.class}-${profile.service}-${profile.kind}-${filenameTimestamp(profile.startedAt)}.pprof.gz`
         return reply
           .header('content-type', object.ContentType ?? 'application/gzip')
           .header('content-disposition', `attachment; filename="${filename}"`)

@@ -52,11 +52,18 @@ const {
   version,
 } = getConfig()
 
+function trimDashes(value: string) {
+  let start = 0
+  while (value[start] === '-') start += 1
+
+  let end = value.length
+  while (end > start && value[end - 1] === '-') end -= 1
+
+  return value.slice(start, end)
+}
+
 function slug(value: string, fallback: string) {
-  const normalized = value
-    .toLowerCase()
-    .replace(/[^a-z0-9.-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
+  const normalized = trimDashes(value.toLowerCase().replace(/[^a-z0-9.-]+/g, '-'))
   return SAFE_SEGMENT.test(normalized) ? normalized : fallback
 }
 

@@ -113,7 +113,7 @@ export async function fetchPprofStream(options: {
       apiKey: options.apiKey,
       path: `/debug/pprof/${options.type}`,
       params: options.type === 'heap-snapshot' ? undefined : { seconds: options.seconds },
-      accept: 'application/octet-stream',
+      accept: options.type === 'heap-snapshot' ? 'application/json' : 'application/gzip',
     })
   )
 }

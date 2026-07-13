@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ logError: vi.fn() }))
+const mocks = vi.hoisted(() => ({
+  loadPprof: vi.fn(),
+  logError: vi.fn(),
+  profilingS3Bucket: undefined as string | undefined,
+}))
 
 vi.mock('../../../config', () => ({
   getConfig: () => ({
     profilingAutomaticEnabled: true,
-    profilingS3Bucket: undefined,
+    profilingS3Bucket: mocks.profilingS3Bucket,
     profilingTriggerDelayP99Ms: 150,
     profilingTriggerElu: 0.55,
     profilingSevereElu: 0.9,
@@ -19,6 +23,11 @@ vi.mock('@internal/monitoring', () => ({
   logger: {},
   logSchema: { error: mocks.logError },
 }))
+vi.mock('./controller', () => ({
+  loadPprof: mocks.loadPprof,
+  ProfilingBusyError: class ProfilingBusyError extends Error {},
+  profileController: { capture: vi.fn(), isActive: () => false },
+}))
 
 import {
   AutomaticProfileTrigger,
@@ -27,7 +36,11 @@ import {
 } from './automatic'
 
 describe('AutomaticProfileTrigger', () => {
-  beforeEach(() => vi.clearAllMocks())
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.profilingS3Bucket = undefined
+    mocks.loadPprof.mockResolvedValue({})
+  })
 
   it('fires only after sustained mean ELU reaches the threshold', () => {
     const trigger = new AutomaticProfileTrigger()
@@ -53,15 +66,31 @@ describe('AutomaticProfileTrigger', () => {
     expect(new AutomaticProfileTrigger(0).sample(0.9, 0, 0)).toBeUndefined()
   })
 
-  it('logs and disables automatic profiling when the bucket is missing', () => {
-    expect(() =>
+  it('logs and disables automatic profiling when the bucket is missing', async () => {
+    await expect(
       startAutomaticProfiling({ service: 'api', signal: new AbortController().signal })
-    ).not.toThrow()
+    ).resolves.toBeUndefined()
     expect(mocks.logError).toHaveBeenCalledWith({}, '[Profiling] automatic profiling disabled', {
       type: 'profiling',
       error: expect.objectContaining({
         message: 'PROFILING_S3_BUCKET is required when automatic profiling is enabled',
       }),
+    })
+  })
+
+  it('logs and disables automatic profiling when the profiler cannot load', async () => {
+    const error = new Error('native profiler unavailable')
+    mocks.profilingS3Bucket = 'profiles'
+    mocks.loadPprof.mockRejectedValue(error)
+    vi.resetModules()
+    const { startAutomaticProfiling: start } = await import('./automatic')
+
+    await expect(
+      start({ service: 'api', signal: new AbortController().signal })
+    ).resolves.toBeUndefined()
+    expect(mocks.logError).toHaveBeenCalledWith({}, '[Profiling] automatic profiling disabled', {
+      type: 'profiling',
+      error,
     })
   })
 

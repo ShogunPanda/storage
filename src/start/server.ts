@@ -71,7 +71,7 @@ async function main() {
     numWorkers,
   } = getConfig()
 
-  startAutomaticProfiling({ service: 'api', signal: shutdownSignal.signal })
+  await startAutomaticProfiling({ service: 'api', signal: shutdownSignal.signal })
 
   // VECTOR_DATABASE_URL is only required when pgvector is actually going to
   // be used: single-tenant mode (it's the maintenance URL used to CREATE

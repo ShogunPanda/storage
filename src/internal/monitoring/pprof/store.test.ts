@@ -76,6 +76,20 @@ describe('profile object keys', () => {
     expect(newer < older).toBe(true)
   })
 
+  it('normalizes long untrusted boundary runs without a backtracking trim', () => {
+    mocks.getGlobal.mockReturnValue(undefined)
+    const key = buildProfileKey({
+      class: 'auto',
+      kind: 'cpu',
+      service: 'api',
+      reason: `${'-'.repeat(10_000)}admin event${'-'.repeat(10_000)}`,
+      startedAt: new Date('2026-07-12T14:30:12.123Z'),
+      durationSeconds: 30,
+    })
+
+    expect(key).toMatch(/_admin-event_storage-host-a_/)
+  })
+
   it('preserves uploaded Watt provenance when listing', async () => {
     mocks.getGlobal.mockReturnValue({ applicationId: 'storage', workerId: 3 })
     const store = new ProfileStore()

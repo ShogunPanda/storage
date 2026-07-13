@@ -45,6 +45,11 @@ const isolateCaptureBudget = captureBudgetForIsolate(
   resolveRuntimeIdentity().workerId
 )
 
+interface AutomaticProfilingOptions {
+  service: string
+  signal: AbortSignal
+}
+
 export class AutomaticProfileTrigger {
   private elu: number[] = []
   private delays: boolean[] = []
@@ -53,6 +58,15 @@ export class AutomaticProfileTrigger {
 
   constructor(private readonly maxCapturesPerHour = isolateCaptureBudget) {}
 
+  private selectReason(elu: number, delayP99Ms: number, meanElu: number) {
+    if (elu >= profilingSevereElu) return 'elu-severe'
+    if (delayP99Ms >= profilingSevereDelayP99Ms) return 'event-loop-delay-severe'
+    if (this.elu.length === 10 && meanElu >= profilingTriggerElu) return 'elu-sustained'
+    if (this.delays.length === 5 && this.delays.filter(Boolean).length >= 3) {
+      return 'event-loop-delay'
+    }
+  }
+
   sample(elu: number, delayP99Ms: number, now = Date.now(), canFire = true) {
     this.elu.push(elu)
     if (this.elu.length > 10) this.elu.shift()
@@ -60,16 +74,7 @@ export class AutomaticProfileTrigger {
     if (this.delays.length > 5) this.delays.shift()
     this.captures = this.captures.filter((at) => now - at < 3_600_000)
     const meanElu = this.elu.reduce((sum, value) => sum + value, 0) / this.elu.length
-    const reason =
-      elu >= profilingSevereElu
-        ? 'elu-severe'
-        : delayP99Ms >= profilingSevereDelayP99Ms
-          ? 'event-loop-delay-severe'
-          : this.elu.length === 10 && meanElu >= profilingTriggerElu
-            ? 'elu-sustained'
-            : this.delays.length === 5 && this.delays.filter(Boolean).length >= 3
-              ? 'event-loop-delay'
-              : undefined
+    const reason = this.selectReason(elu, delayP99Ms, meanElu)
     if (
       !reason ||
       !canFire ||
@@ -83,7 +88,7 @@ export class AutomaticProfileTrigger {
   }
 }
 
-export function startAutomaticProfiling(options: { service: string; signal: AbortSignal }) {
+export async function startAutomaticProfiling(options: AutomaticProfilingOptions) {
   if (!profilingAutomaticEnabled) return
   if (!profilingS3Bucket) {
     logSchema.error(logger, '[Profiling] automatic profiling disabled', {
@@ -92,13 +97,22 @@ export function startAutomaticProfiling(options: { service: string; signal: Abor
     })
     return
   }
-  // warm up the module
-  void loadPprof().catch(() => {})
+  try {
+    await loadPprof()
+  } catch (error) {
+    logSchema.error(logger, '[Profiling] automatic profiling disabled', {
+      type: 'profiling',
+      error,
+    })
+    return
+  }
+  if (options.signal.aborted) return
   const histogram = monitorEventLoopDelay({ resolution: 20 })
   const trigger = new AutomaticProfileTrigger()
   let previous = performance.eventLoopUtilization()
   histogram.enable()
-  const timer = setInterval(() => {
+
+  const sampleAndCaptureProfile = () => {
     const current = performance.eventLoopUtilization()
     const elu = performance.eventLoopUtilization(current, previous).utilization
     previous = current
@@ -126,7 +140,9 @@ export function startAutomaticProfiling(options: { service: string; signal: Abor
             error,
           })
       })
-  }, 1_000)
+  }
+
+  const timer = setInterval(sampleAndCaptureProfile, 1_000)
   timer.unref()
   options.signal.addEventListener(
     'abort',
