@@ -108,6 +108,55 @@ describe('Database Watt client transport', () => {
       requestId: sent[0].data.requestId,
     })
   })
+
+  it('rolls back a transaction that a batch opened after its caller gave up', async () => {
+    let resolveBatch!: (value: unknown) => void
+    const { sent } = installWattMessagingMock({
+      'database.batch': new Promise((resolve) => {
+        resolveBatch = resolve
+      }),
+      'database.cancel': { cancelled: false },
+      'database.rollbackTransaction': { rolledBack: true },
+    })
+    const client = new DatabaseWattClient()
+    const controller = new AbortController()
+
+    const batch = client.batch(
+      {
+        destination: createDestination(),
+        statements: [{ sql: 'SELECT 1' }],
+        commit: false,
+      },
+      { signal: controller.signal }
+    )
+    controller.abort()
+
+    await expect(batch).rejects.toMatchObject({ name: 'AbortError' })
+    resolveBatch({ lockId: 'lock-a', rowCount: 0, rows: [], fields: [] })
+    await vi.waitFor(() => expect(sent).toHaveLength(3))
+
+    expect(sent.map(({ message }) => message)).toEqual([
+      'database.batch',
+      'database.cancel',
+      'database.rollbackTransaction',
+    ])
+    expect(sent[2].data).toMatchObject({ lockId: 'lock-a' })
+  })
+
+  it('uses distinct request ids', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.query': { rowCount: 0, rows: [] },
+    })
+    const client = new DatabaseWattClient()
+
+    await Promise.all(
+      Array.from({ length: 50 }, () =>
+        client.query({ destination: createDestination(), sql: 'SELECT 1' })
+      )
+    )
+
+    expect(new Set(sent.map(({ data }) => data.requestId)).size).toBe(50)
+  })
 })
 
 function createDestination() {

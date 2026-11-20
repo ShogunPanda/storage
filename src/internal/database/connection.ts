@@ -49,6 +49,12 @@ export interface TenantConnection extends DatabaseTransactionalExecutor {
   asSuperUser(): TenantConnection
   transaction(options?: TransactionOptions): Promise<DatabaseTransaction>
   setScope(transaction: DatabaseExecutor): Promise<void>
+  /**
+   * Optional: an executor that runs exactly one statement as a whole scoped transaction
+   * (what transaction(), setScope() and commit() do around it) more cheaply than the
+   * individual steps. Connections that do not provide it take the regular path.
+   */
+  singleStatementExecutor?(options?: TransactionOptions): DatabaseExecutor
 }
 
 export function isDatabaseTransaction(executor: DatabaseExecutor): executor is DatabaseTransaction {

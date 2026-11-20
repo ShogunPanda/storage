@@ -41,6 +41,7 @@ describe('Watt PostgreSQL connection adapter', () => {
     const transport: DatabaseWattTransport = {
       query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: 1 }] }),
       acquire: vi.fn(),
+      batch: vi.fn(),
       lockedQuery: vi.fn(),
       release: vi.fn(),
       beginTransaction: vi.fn(),
@@ -89,10 +90,10 @@ describe('Watt PostgreSQL connection adapter', () => {
     expect(sent[0].data.requestId).toEqual(expect.any(String))
   })
 
-  it('runs transaction lifecycle through lock-bound messages', async () => {
+  it('opens a transaction with its first query and commits it by lock', async () => {
     const { sent } = installWattMessagingMock({
-      'database.beginTransaction': { lockId: 'lock-a' },
-      'database.lockedQuery': { rowCount: 1, rows: [{ ok: true }] },
+      'database.batch': { lockId: 'lock-a', rowCount: 1, rows: [{ ok: true }] },
+      'database.lockedQuery': { rowCount: 1, rows: [{ ok: false }] },
       'database.commitTransaction': { committed: true },
     })
     const connection = await getWattPostgresConnection(createConnectionOptions())
@@ -102,35 +103,38 @@ describe('Watt PostgreSQL connection adapter', () => {
       readOnly: true,
       timeout: 5_000,
     })
-    const result = await tx.query('SELECT 1')
+    expect(sent).toHaveLength(0)
+
+    const first = await tx.query('SELECT 1')
+    const second = await tx.query('SELECT 2')
     await tx.commit()
 
-    expect(result.rows).toEqual([{ ok: true }])
+    expect(first.rows).toEqual([{ ok: true }])
+    expect(second.rows).toEqual([{ ok: false }])
     expect(sent.map((message) => message.message)).toEqual([
-      'database.beginTransaction',
-      'database.lockedQuery',
+      'database.batch',
       'database.lockedQuery',
       'database.commitTransaction',
     ])
+    // BEGIN, the deferred statement timeout and the first query travel together.
     expect(sent[0].data).toMatchObject({
       destination: createPoolTarget(),
       isolationLevel: 'SERIALIZABLE',
       readOnly: true,
+      commit: false,
+      statements: [
+        { sql: "SELECT set_config('statement_timeout', $1, true)", values: ['5000ms'] },
+        { sql: 'SELECT 1' },
+      ],
     })
-    // Without setScope the deferred statement timeout is applied before the first query.
-    expect(sent[1].data).toMatchObject({
-      lockId: 'lock-a',
-      sql: "SELECT set_config('statement_timeout', $1, true)",
-      values: ['5000ms'],
-    })
-    expect(sent[2].data).toMatchObject({ lockId: 'lock-a', sql: 'SELECT 1' })
+    expect(sent[1].data).toMatchObject({ lockId: 'lock-a', sql: 'SELECT 2' })
+    expect(sent[2].data).toMatchObject({ lockId: 'lock-a' })
     expect(tx.isCompleted()).toBe(true)
   })
 
-  it('folds transaction settings into the scope statement', async () => {
+  it('folds transaction settings into the scope statement sent with the first query', async () => {
     const { sent } = installWattMessagingMock({
-      'database.beginTransaction': { lockId: 'lock-a' },
-      'database.lockedQuery': { rowCount: 1, rows: [{ ok: true }] },
+      'database.batch': { lockId: 'lock-a', rowCount: 1, rows: [{ ok: true }] },
     })
     const connection = await getWattPostgresConnection({
       ...createConnectionOptions(),
@@ -141,24 +145,60 @@ describe('Watt PostgreSQL connection adapter', () => {
     await connection.setScope(tx)
     await tx.query('SELECT 1')
 
+    expect(sent.map((message) => message.message)).toEqual(['database.batch'])
+    const statements = sent[0].data.statements as Array<{ sql: string; values?: unknown[] }>
+    expect(statements).toHaveLength(2)
+    expect(statements[0].sql).toContain("set_config('role', $1, true)")
+    expect(statements[0].sql).toContain("set_config('statement_timeout', $10, true)")
+    expect(statements[0].sql).toContain("set_config('search_path', $11, true)")
+    expect((statements[0].values as unknown[]).slice(9)).toEqual(['5000ms', searchPath.join(',')])
+    expect(statements[1]).toMatchObject({ sql: 'SELECT 1' })
+  })
+
+  it('sends the scope as a query once the transaction has started', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
+      'database.lockedQuery': { rowCount: 0, rows: [] },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+
+    const tx = await connection.transaction()
+    await tx.query('SAVEPOINT a')
+    await connection.asSuperUser().setScope(tx)
+
     expect(sent.map((message) => message.message)).toEqual([
-      'database.beginTransaction',
-      'database.lockedQuery',
+      'database.batch',
       'database.lockedQuery',
     ])
-    expect(sent[1].data.sql).toContain("set_config('statement_timeout', $10, true)")
-    expect(sent[1].data.sql).toContain("set_config('search_path', $11, true)")
-    expect((sent[1].data.values as unknown[]).slice(9)).toEqual(['5000ms', searchPath.join(',')])
-    expect(sent[2].data).toMatchObject({ sql: 'SELECT 1' })
+    expect(sent[1].data.sql).toContain("set_config('role', $1, true)")
+    expect((sent[1].data.values as unknown[])[0]).toBe('service_role')
+  })
+
+  it('opens the transaction only once for concurrent first queries', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
+      'database.lockedQuery': { rowCount: 0, rows: [] },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+
+    const tx = await connection.transaction()
+    await Promise.all([tx.query('SELECT 1'), tx.query('SELECT 2')])
+
+    expect(sent.map((message) => message.message)).toEqual([
+      'database.batch',
+      'database.lockedQuery',
+    ])
+    expect(sent[1].data).toMatchObject({ lockId: 'lock-a', sql: 'SELECT 2' })
   })
 
   it('sends unknown isolation levels as a plain BEGIN like the direct path', async () => {
     const { sent } = installWattMessagingMock({
-      'database.beginTransaction': { lockId: 'lock-a' },
+      'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
     })
     const connection = await getWattPostgresConnection(createConnectionOptions())
 
-    await connection.beginTransaction({ isolation: 'read uncommitted' })
+    const tx = await connection.beginTransaction({ isolation: 'read uncommitted' })
+    await tx.query('SELECT 1')
 
     expect(sent[0].data.isolationLevel).toBeUndefined()
   })
@@ -180,19 +220,130 @@ describe('Watt PostgreSQL connection adapter', () => {
 
   it('rolls back transactions through Database Watt messaging', async () => {
     const { sent } = installWattMessagingMock({
-      'database.beginTransaction': { lockId: 'lock-a' },
+      'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
       'database.rollbackTransaction': { rolledBack: true },
     })
     const connection = await getWattPostgresConnection(createConnectionOptions())
 
     const tx = await connection.transaction()
+    await tx.query('SELECT 1')
     await tx.rollback()
 
     expect(sent.map((message) => message.message)).toEqual([
-      'database.beginTransaction',
+      'database.batch',
       'database.rollbackTransaction',
     ])
     expect(tx.isCompleted()).toBe(true)
+  })
+
+  it('sends nothing for a transaction that never ran a query', async () => {
+    const { sent } = installWattMessagingMock()
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+
+    const committed = await connection.transaction()
+    await connection.setScope(committed)
+    await committed.commit()
+    const rolledBack = await connection.transaction()
+    await rolledBack.rollback()
+
+    expect(sent).toHaveLength(0)
+    expect(committed.isCompleted()).toBe(true)
+    expect(rolledBack.isCompleted()).toBe(true)
+  })
+
+  it('completes a transaction whose first batch failed', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': {
+        code: 'POSTGRES_ERROR',
+        message: 'permission denied for table objects',
+        sqlState: '42501',
+        connectionDiscarded: true,
+      },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+    const tx = await connection.transaction()
+
+    await expect(tx.query('SELECT 1')).rejects.toMatchObject({ code: '42501' })
+    expect(tx.isCompleted()).toBe(true)
+    await tx.rollback()
+    expect(sent.map((message) => message.message)).toEqual(['database.batch'])
+  })
+
+  it('runs a single statement as one batch message that commits', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': { rowCount: 1, rows: [{ id: 1 }] },
+    })
+    const connection = await getWattPostgresConnection({
+      ...createConnectionOptions(),
+      isExternalPool: true,
+    })
+
+    const executor = connection.singleStatementExecutor?.() as DatabaseExecutor
+    const result = await executor.query({ text: 'SELECT $1::int AS id', values: [1] })
+
+    expect(result.rows).toEqual([{ id: 1 }])
+    expect(sent.map((message) => message.message)).toEqual(['database.batch'])
+    expect(sent[0].data).toMatchObject({ destination: { isExternalPool: true }, commit: true })
+    const statements = sent[0].data.statements as Array<{ sql: string; values?: unknown[] }>
+    expect(statements).toHaveLength(2)
+    expect(statements[0].sql).toContain("set_config('role', $1, true)")
+    expect(statements[0].sql).toContain("set_config('search_path'")
+    expect(statements[1]).toEqual({ sql: 'SELECT $1::int AS id', values: [1] })
+
+    await expect(executor.query('SELECT 2')).rejects.toThrow(
+      'A single statement executor runs only one statement'
+    )
+  })
+
+  it('parses raw rows with the pg type parsers', async () => {
+    installWattMessagingMock({
+      'database.query': {
+        rowCount: 2,
+        fields: [
+          { name: 'id', dataTypeID: 23 },
+          { name: 'size', dataTypeID: 20 },
+          { name: 'created_at', dataTypeID: 1184 },
+          { name: 'metadata', dataTypeID: 3802 },
+          { name: 'path_tokens', dataTypeID: 1009 },
+          { name: 'is_versioned', dataTypeID: 16 },
+        ],
+        rows: [
+          ['1', '1024', '2026-11-20 15:08:00.123+00', '{"eTag":"abc"}', '{a,b}', 't'],
+          [null, null, null, null, null, null],
+        ],
+      },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+
+    const result = await connection.query('SELECT 1')
+
+    expect(result.rowCount).toBe(2)
+    expect(result.fields.map((field) => field.name)).toEqual([
+      'id',
+      'size',
+      'created_at',
+      'metadata',
+      'path_tokens',
+      'is_versioned',
+    ])
+    expect(result.rows).toEqual([
+      {
+        id: 1,
+        size: 1024,
+        created_at: new Date('2026-11-20T15:08:00.123Z'),
+        metadata: { eTag: 'abc' },
+        path_tokens: ['a', 'b'],
+        is_versioned: true,
+      },
+      {
+        id: null,
+        size: null,
+        created_at: null,
+        metadata: null,
+        path_tokens: null,
+        is_versioned: null,
+      },
+    ])
   })
 
   it('maps PostgreSQL error responses back to pg DatabaseError', async () => {
@@ -237,7 +388,7 @@ describe('Watt PostgreSQL connection adapter', () => {
 
   it('completes a transaction whose connection the Database application discarded', async () => {
     installWattMessagingMock({
-      'database.beginTransaction': { lockId: 'lock-a' },
+      'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
       'database.lockedQuery': {
         code: 'POSTGRES_ERROR',
         message: 'terminating connection due to administrator command',
@@ -248,7 +399,8 @@ describe('Watt PostgreSQL connection adapter', () => {
     const connection = await getWattPostgresConnection(createConnectionOptions())
     const tx = await connection.beginTransaction()
 
-    await expect(tx.query('SELECT 1')).rejects.toMatchObject({ code: '57P01' })
+    await tx.query('SELECT 1')
+    await expect(tx.query('SELECT 2')).rejects.toMatchObject({ code: '57P01' })
     expect(tx.isCompleted()).toBe(true)
   })
 

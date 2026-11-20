@@ -23,16 +23,29 @@ type MockedEnvironment = {
   }>
 }
 
-function createMockClient(rows: unknown[], failures: { begin: number }): MockClient {
+type QueryConfig = { text: string; values?: unknown[]; rowMode?: string }
+
+function createMockClient(
+  rows: Record<string, unknown>[],
+  failures: { begin: number; sql?: string }
+): MockClient {
   const client: MockClient = {
     queries: [],
-    query: vi.fn(async (sql: string, values?: unknown[]) => {
-      client.queries.push({ sql, values })
+    query: vi.fn(async (config: string | QueryConfig, values?: unknown[]) => {
+      const sql = typeof config === 'string' ? config : config.text
+      client.queries.push({ sql, values: typeof config === 'string' ? values : config.values })
       if (sql.startsWith('BEGIN') && failures.begin > 0) {
         failures.begin--
         throw new Error('Connection terminated unexpectedly')
       }
-      return { rowCount: rows.length, rows }
+      if (sql === failures.sql) {
+        throw new Error('relation "missing" does not exist')
+      }
+      // Statements run for storage workers use array row mode with raw text values.
+      if (typeof config !== 'string' && config.rowMode === 'array') {
+        return toRawResult(rows)
+      }
+      return { rowCount: rows.length, rows, fields: [] }
     }),
     release: vi.fn(),
   }
@@ -40,15 +53,32 @@ function createMockClient(rows: unknown[], failures: { begin: number }): MockCli
   return client
 }
 
+function toRawResult(rows: Record<string, unknown>[]) {
+  const names = rows.length > 0 ? Object.keys(rows[0]) : []
+  return {
+    rowCount: rows.length,
+    rows: rows.map((row) => names.map((name) => (row[name] === null ? null : String(row[name])))),
+    fields: names.map((name) => ({ name, dataTypeID: 25 })),
+  }
+}
+
+// The response for the default `[{ ok: true }]` rows.
+const okResponse = { rowCount: 1, rows: [['true']], fields: [{ name: 'ok', dataTypeID: 25 }] }
+
 async function loadApp(
-  options: { env?: Record<string, string>; queryRows?: unknown[]; beginFailures?: number } = {}
+  options: {
+    env?: Record<string, string>
+    queryRows?: Record<string, unknown>[]
+    beginFailures?: number
+    failingSql?: string
+  } = {}
 ): Promise<MockedEnvironment> {
   vi.resetModules()
 
   const clients: MockClient[] = []
   const pools: MockedEnvironment['pools'] = []
   const queryRows = options.queryRows || [{ ok: true }]
-  const failures = { begin: options.beginFailures ?? 0 }
+  const failures = { begin: options.beginFailures ?? 0, sql: options.failingSql }
 
   process.env = {
     ...originalEnv,
@@ -142,8 +172,8 @@ describe('database Watt application messaging handlers', () => {
       values: [1],
     })
 
-    expect(response).toEqual({ rowCount: 1, rows: [{ ok: true }] })
-    expect(clients[0].query).toHaveBeenCalledWith('SELECT 1', [1])
+    expect(response).toEqual(okResponse)
+    expect(clients[0].queries).toEqual([{ sql: 'SELECT 1', values: [1] }])
     expect(clients[0].release).toHaveBeenCalledWith(undefined)
   })
 
@@ -273,7 +303,7 @@ describe('database Watt application messaging handlers', () => {
       sql: 'SELECT 1',
     })
 
-    expect(response).toEqual({ rowCount: 1, rows: [{ ok: true }] })
+    expect(response).toEqual(okResponse)
   })
 
   it('reclaims idle pools of other destinations when the global budget is exhausted', async () => {
@@ -292,7 +322,7 @@ describe('database Watt application messaging handlers', () => {
       sql: 'SELECT 1',
     })
 
-    expect(response).toEqual({ rowCount: 1, rows: [{ ok: true }] })
+    expect(response).toEqual(okResponse)
     expect(pools[0].ended).toBe(true)
   })
 
@@ -367,6 +397,122 @@ describe('database Watt application messaging handlers', () => {
     expect(pools).toHaveLength(2)
     expect(pools[0].ended).toBe(true)
     expect(pools[1].config).toMatchObject({ connectionString: 'postgres://tenant-db-b' })
+  })
+
+  it('runs a whole single-statement transaction from one batch message', async () => {
+    const { clients, messaging } = await loadApp()
+
+    const response = await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      requestId: 'req-1',
+      statements: [
+        { sql: 'SELECT set_config($1, $2, true)', values: ['role', 'authenticated'] },
+        { sql: 'SELECT 1', values: [1] },
+      ],
+      commit: true,
+    })
+
+    expect(response).toEqual(okResponse)
+    expect(clients).toHaveLength(1)
+    expect(clients[0].queries).toEqual([
+      { sql: 'BEGIN', values: undefined },
+      { sql: 'SELECT set_config($1, $2, true)', values: ['role', 'authenticated'] },
+      { sql: 'SELECT 1', values: [1] },
+      { sql: 'COMMIT', values: undefined },
+    ])
+    expect(clients[0].release).toHaveBeenCalledTimes(1)
+    expect(clients[0].release.mock.calls[0][0]).toBeUndefined()
+  })
+
+  it('opens a transaction from a batch message and keeps it pinned', async () => {
+    const { clients, messaging } = await loadApp()
+
+    const batch = (await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      isolationLevel: 'serializable',
+      statements: [{ sql: 'SELECT 1' }],
+      commit: false,
+    })) as typeof okResponse & { lockId: string }
+
+    expect(batch).toMatchObject(okResponse)
+    expect(batch.lockId).toEqual(expect.any(String))
+    expect(clients[0].release).not.toHaveBeenCalled()
+
+    await messaging.send('database', 'database.lockedQuery', {
+      lockId: batch.lockId,
+      sql: 'SELECT 2',
+    })
+    const commit = await messaging.send('database', 'database.commitTransaction', {
+      lockId: batch.lockId,
+    })
+
+    expect(commit).toEqual({ committed: true })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual([
+      'BEGIN ISOLATION LEVEL SERIALIZABLE',
+      'SELECT 1',
+      'SELECT 2',
+      'COMMIT',
+    ])
+    expect(clients[0].release).toHaveBeenCalledWith(undefined)
+  })
+
+  it('rolls back a failed batch and reports that no transaction is left', async () => {
+    const { clients, messaging } = await loadApp({ failingSql: 'SELECT broken' })
+
+    const response = (await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      requestId: 'req-1',
+      statements: [{ sql: 'SELECT broken' }, { sql: 'SELECT 1' }],
+      commit: false,
+    })) as DatabaseErrorResponse
+
+    expect(response).toMatchObject({
+      message: 'relation "missing" does not exist',
+      requestId: 'req-1',
+      connectionDiscarded: true,
+    })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual([
+      'BEGIN',
+      'SELECT broken',
+      'ROLLBACK',
+    ])
+    expect(clients[0].release).toHaveBeenCalledWith(undefined)
+  })
+
+  it('retries BEGIN of a batch on a broken pooled connection', async () => {
+    const { clients, messaging } = await loadApp({ beginFailures: 1 })
+
+    const response = await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT 1' }],
+      commit: true,
+    })
+
+    expect(response).toEqual(okResponse)
+    expect(clients).toHaveLength(2)
+    expect(clients[0].release).toHaveBeenCalledWith(expect.any(Error))
+    expect(clients[1].queries.map((query) => query.sql)).toEqual(['BEGIN', 'SELECT 1', 'COMMIT'])
+  })
+
+  it.each([
+    [{ statements: [] }, 'statements must be a non-empty array'],
+    [{ statements: [{ sql: 1 }] }, 'sql must be a string'],
+    [{ statements: [{ sql: 'SELECT 1' }], commit: 'yes' }, 'commit must be a boolean'],
+  ])('rejects malformed batch requests %o', async (overrides, message) => {
+    const { clients, messaging } = await loadApp()
+
+    const defaults = {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT 1' }],
+      commit: true,
+    }
+    const response = (await messaging.send('database', 'database.batch', {
+      ...defaults,
+      ...overrides,
+    })) as DatabaseErrorResponse
+
+    expect(response).toMatchObject({ code: 'PROTOCOL_ERROR', message })
+    expect(clients).toHaveLength(0)
   })
 
   it('closes pools and rejects new work after shutdown starts', async () => {

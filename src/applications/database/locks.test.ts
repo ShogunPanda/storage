@@ -18,9 +18,12 @@ function createDestination(): DatabasePoolTarget {
   }
 }
 
+// What pg returns for a statement run in array row mode with raw (unparsed) values.
+const rawResult = { rowCount: 1, rows: [['t']], fields: [{ name: 'ok', dataTypeID: 16 }] }
+
 function createClient(): FakeClient {
   return {
-    query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ ok: true }] }),
+    query: vi.fn().mockResolvedValue(rawResult),
     release: vi.fn(),
   }
 }
@@ -33,8 +36,11 @@ describe('database lock registry', () => {
 
     const result = await locks.query(lockId, 'SELECT 1', [1])
 
-    expect(result).toEqual({ rowCount: 1, rows: [{ ok: true }] })
-    expect(client.query).toHaveBeenCalledWith('SELECT 1', [1])
+    // Rows go back as raw text: the storage worker parses them.
+    expect(result).toEqual({ rowCount: 1, rows: [['t']], fields: [{ name: 'ok', dataTypeID: 16 }] })
+    expect(client.query).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'SELECT 1', values: [1], rowMode: 'array' })
+    )
     expect(client.release).not.toHaveBeenCalled()
 
     await locks.release(lockId)
@@ -65,7 +71,7 @@ describe('database lock registry', () => {
     expect(client.release).not.toHaveBeenCalled()
 
     await locks.rollback(lockId)
-    expect(client.query).toHaveBeenCalledWith('ROLLBACK', undefined)
+    expect(client.query).toHaveBeenCalledWith('ROLLBACK')
     expect(client.release).toHaveBeenCalledTimes(1)
     await locks.close()
   })
@@ -77,7 +83,7 @@ describe('database lock registry', () => {
 
     await locks.commit(lockId)
 
-    expect(client.query).toHaveBeenCalledWith('COMMIT', undefined)
+    expect(client.query).toHaveBeenCalledWith('COMMIT')
     expect(client.release).toHaveBeenCalledTimes(1)
     await expect(locks.rollback(lockId)).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' })
     await locks.close()
@@ -95,13 +101,13 @@ describe('database lock registry', () => {
           order.push('first-start')
           releaseFirstQuery = () => {
             order.push('first-end')
-            resolve({ rowCount: 1, rows: [] })
+            resolve({ rowCount: 1, rows: [], fields: [] })
           }
         })
     )
     client.query.mockImplementationOnce(async () => {
       order.push('second-start')
-      return { rowCount: 1, rows: [] }
+      return { rowCount: 1, rows: [], fields: [] }
     })
 
     const lockId = locks.create(createDestination(), client as never)
@@ -131,7 +137,7 @@ describe('database lock registry', () => {
     const released = await locks.releaseOwner(ownerA)
 
     expect(released).toBe(1)
-    expect(clientA.query).toHaveBeenCalledWith('ROLLBACK', undefined)
+    expect(clientA.query).toHaveBeenCalledWith('ROLLBACK')
     expect(clientA.release).toHaveBeenCalledWith(undefined)
     expect(locks.has(lockA)).toBe(false)
     expect(locks.has(lockB)).toBe(true)
@@ -151,5 +157,41 @@ describe('database lock registry', () => {
 
     expect(client.release).toHaveBeenCalledWith(expect.any(Error))
     await locks.close()
+  })
+
+  it('only lets the owner of a lock use it', async () => {
+    const locks = new LockRegistry(getConfig())
+    const owner = {}
+    const client = createClient()
+    const lockId = locks.create(createDestination(), client as never, true, owner)
+
+    await expect(locks.query(lockId, 'SELECT 1', undefined, {})).rejects.toMatchObject({
+      code: 'PROTOCOL_ERROR',
+      message: 'Unknown lock ID',
+    })
+    await expect(locks.commit(lockId, {})).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' })
+    expect(client.query).not.toHaveBeenCalled()
+
+    await locks.query(lockId, 'SELECT 1', undefined, owner)
+    await locks.commit(lockId, owner)
+    expect(client.release).toHaveBeenCalledTimes(1)
+    await locks.close()
+  })
+
+  it('creates distinct lock IDs that differ between registries', async () => {
+    const first = new LockRegistry(getConfig())
+    const second = new LockRegistry(getConfig())
+
+    const ids = [
+      first.create(createDestination(), createClient() as never),
+      first.create(createDestination(), createClient() as never),
+      second.create(createDestination(), createClient() as never),
+    ]
+
+    expect(new Set(ids).size).toBe(3)
+    // A restarted Database application must not reuse the lock IDs of the previous one.
+    expect(ids[2].split('.')[0]).not.toBe(ids[0].split('.')[0])
+    await first.close()
+    await second.close()
   })
 })

@@ -54,6 +54,26 @@ export function validateBeginTransactionEnvelope(request: unknown): void {
   }
 }
 
+export function validateBatchEnvelope(request: unknown): void {
+  validateBeginTransactionEnvelope(request)
+  const { statements, commit } = request as { statements?: unknown; commit?: unknown }
+
+  if (!Array.isArray(statements) || statements.length === 0) {
+    throw new DatabaseWattError('PROTOCOL_ERROR', 'statements must be a non-empty array')
+  }
+
+  for (const statement of statements) {
+    if (!statement || typeof statement !== 'object') {
+      throw new DatabaseWattError('PROTOCOL_ERROR', 'each statement must be an object')
+    }
+    validateQueryEnvelope(statement)
+  }
+
+  if (typeof commit !== 'boolean') {
+    throw new DatabaseWattError('PROTOCOL_ERROR', 'commit must be a boolean')
+  }
+}
+
 export function validateLockRequestEnvelope(request: unknown): void {
   validateBaseEnvelope(request)
   const lockId = (request as { lockId?: unknown }).lockId

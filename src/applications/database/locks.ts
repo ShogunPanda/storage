@@ -1,10 +1,10 @@
 import { randomBytes } from 'node:crypto'
 import { isConnectionStateError } from '@internal/database/postgres/pool-errors'
-import type { PoolClient, QueryResultRow } from 'pg'
+import type { PoolClient } from 'pg'
 import type { StorageConfigType } from '../../config.js'
 import { DatabaseWattError } from './errors.js'
 import { runQuery, toQueryResponse } from './pools.js'
-import type { DatabasePoolTarget, QueryResponse } from './protocol.js'
+import type { DatabasePoolTarget, RawQueryResponse } from './protocol.js'
 
 type LockRecord = {
   busy: Promise<unknown>
@@ -22,6 +22,11 @@ export class LockRegistry {
   private readonly config: StorageConfigType
   private readonly locks = new Map<string, LockRecord>()
   private readonly cleanupInterval: NodeJS.Timeout
+  // Lock IDs are a random prefix per registry plus a counter: unique across restarts of
+  // the Database application without generating random bytes for every transaction.
+  // They are not secrets: a lock can only be used through the channel that created it.
+  private readonly lockIdPrefix = randomBytes(12).toString('base64url') + '.'
+  private lockIdCounter = 0
 
   constructor(config: StorageConfigType) {
     this.config = config
@@ -40,7 +45,7 @@ export class LockRegistry {
     inTransaction = false,
     owner?: object
   ): string {
-    const lockId = randomBytes(32).toString('base64url')
+    const lockId = this.lockIdPrefix + ++this.lockIdCounter
     const now = Date.now()
     this.locks.set(lockId, {
       busy: Promise.resolve(),
@@ -77,29 +82,38 @@ export class LockRegistry {
     return this.locks.get(lockId)?.destination.id
   }
 
-  getClient(lockId: string): PoolClient {
-    return this.getLock(lockId).client
+  getClient(lockId: string, owner?: object): PoolClient {
+    return this.getLock(lockId, owner).client
   }
 
-  async query<T extends QueryResultRow = QueryResultRow>(
+  async query(
     lockId: string,
     sql: string,
-    values?: unknown[]
-  ): Promise<QueryResponse<T>> {
-    return this.withLock(lockId, async (lock) => {
-      const result = await runQuery<T>(lock.client, sql, values)
-      return toQueryResponse(result)
-    })
+    values?: unknown[],
+    owner?: object
+  ): Promise<RawQueryResponse> {
+    return this.withLock(
+      lockId,
+      async (lock) => {
+        const result = await runQuery(lock.client, sql, values)
+        return toQueryResponse(result)
+      },
+      owner
+    )
   }
 
-  async release(lockId: string): Promise<void> {
-    await this.withLock(lockId, async (lock) => {
-      if (lock.inTransaction) {
-        throw new DatabaseWattError('PROTOCOL_ERROR', 'Cannot release a transaction lock')
-      }
+  async release(lockId: string, owner?: object): Promise<void> {
+    await this.withLock(
+      lockId,
+      async (lock) => {
+        if (lock.inTransaction) {
+          throw new DatabaseWattError('PROTOCOL_ERROR', 'Cannot release a transaction lock')
+        }
 
-      this.remove(lock, undefined)
-    })
+        this.remove(lock, undefined)
+      },
+      owner
+    )
   }
 
   async markTransaction(lockId: string): Promise<void> {
@@ -108,41 +122,49 @@ export class LockRegistry {
     })
   }
 
-  async commit(lockId: string): Promise<void> {
-    await this.withLock(lockId, async (lock) => {
-      if (!lock.inTransaction) {
-        throw new DatabaseWattError('PROTOCOL_ERROR', 'Lock is not in a transaction')
-      }
+  async commit(lockId: string, owner?: object): Promise<void> {
+    await this.withLock(
+      lockId,
+      async (lock) => {
+        if (!lock.inTransaction) {
+          throw new DatabaseWattError('PROTOCOL_ERROR', 'Lock is not in a transaction')
+        }
 
-      let releaseError: Error | undefined
-      try {
-        await runQuery(lock.client, 'COMMIT')
-      } catch (error) {
-        releaseError = error instanceof Error ? error : new Error(String(error))
-        throw error
-      } finally {
-        this.remove(lock, releaseError)
-      }
-    })
+        let releaseError: Error | undefined
+        try {
+          await lock.client.query('COMMIT')
+        } catch (error) {
+          releaseError = error instanceof Error ? error : new Error(String(error))
+          throw error
+        } finally {
+          this.remove(lock, releaseError)
+        }
+      },
+      owner
+    )
   }
 
-  async rollback(lockId: string): Promise<void> {
-    await this.withLock(lockId, async (lock) => {
-      if (!lock.inTransaction) {
-        this.remove(lock, undefined)
-        return
-      }
+  async rollback(lockId: string, owner?: object): Promise<void> {
+    await this.withLock(
+      lockId,
+      async (lock) => {
+        if (!lock.inTransaction) {
+          this.remove(lock, undefined)
+          return
+        }
 
-      let releaseError: Error | undefined
-      try {
-        await runQuery(lock.client, 'ROLLBACK')
-      } catch (error) {
-        releaseError = error instanceof Error ? error : new Error(String(error))
-        throw error
-      } finally {
-        this.remove(lock, releaseError)
-      }
-    })
+        let releaseError: Error | undefined
+        try {
+          await lock.client.query('ROLLBACK')
+        } catch (error) {
+          releaseError = error instanceof Error ? error : new Error(String(error))
+          throw error
+        } finally {
+          this.remove(lock, releaseError)
+        }
+      },
+      owner
+    )
   }
 
   async purge(lockId: string, releaseError?: Error): Promise<void> {
@@ -171,7 +193,7 @@ export class LockRegistry {
 
     let releaseError: Error | undefined
     if (lock.inTransaction) {
-      releaseError = await runQuery(lock.client, 'ROLLBACK').then(
+      releaseError = await lock.client.query('ROLLBACK').then(
         () => undefined,
         (error) => (error instanceof Error ? error : new Error(String(error)))
       )
@@ -179,8 +201,12 @@ export class LockRegistry {
     this.remove(lock, releaseError)
   }
 
-  private async withLock<T>(lockId: string, fn: (lock: LockRecord) => Promise<T>): Promise<T> {
-    const lock = this.getLock(lockId)
+  private async withLock<T>(
+    lockId: string,
+    fn: (lock: LockRecord) => Promise<T>,
+    owner?: object
+  ): Promise<T> {
+    const lock = this.getLock(lockId, owner)
     const work = lock.busy.then(async () => {
       this.assertUsable(lock)
       lock.lastUsedAt = Date.now()
@@ -199,9 +225,11 @@ export class LockRegistry {
     return work
   }
 
-  private getLock(lockId: string): LockRecord {
+  // A lock created for a messaging channel can only be used through that channel, so one
+  // storage worker cannot reach into another worker's transaction.
+  private getLock(lockId: string, owner?: object): LockRecord {
     const lock = this.locks.get(lockId)
-    if (!lock || lock.terminal) {
+    if (!lock || lock.terminal || (owner && lock.owner && lock.owner !== owner)) {
       throw new DatabaseWattError('PROTOCOL_ERROR', 'Unknown lock ID')
     }
     return lock

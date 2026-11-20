@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { removeGlobals } from '@platformatic/globals'
 import { setupLoopbackMessaging } from '@platformatic/runtime'
+import { types } from 'pg'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { getConfig } from '../../config.js'
 import type { DatabasePoolTarget } from './protocol.js'
@@ -12,6 +13,7 @@ type ApplicationContext = {
 
 type DatabaseWattStats = {
   acquire: number
+  batch: number
   beginTransaction: number
   cancel: number
   commitTransaction: number
@@ -36,12 +38,30 @@ type SavepointResponse = {
   outerBucket: string
 }
 
-type QueryRowsResponse = {
-  rows: Array<{ value: number }>
+// Rows come back as raw text values; the storage worker parses them with the pg type parsers.
+type RawRowsResponse = {
+  fields: Array<{ name: string; dataTypeID: number }>
+  rows: Array<Array<string | null>>
+  rowCount: number
 }
 
-type BucketRowsResponse = {
-  rows: BucketResponse[]
+type QueryRowsResponse = RawRowsResponse
+
+type BatchResponse = RawRowsResponse & { lockId?: string }
+
+function decodeRows<T>(response: RawRowsResponse): T[] {
+  return response.rows.map(
+    (raw) =>
+      Object.fromEntries(
+        response.fields.map((field, i) => {
+          const value = raw[i]
+          return [
+            field.name,
+            value === null ? null : types.getTypeParser(field.dataTypeID, 'text')(value),
+          ]
+        })
+      ) as T
+  )
 }
 
 type LockResponse = {
@@ -152,7 +172,7 @@ async function getBucket(
   bucketName: string,
   destination = testDestination()
 ): Promise<BucketResponse | undefined> {
-  const result = await checkedResult<BucketRowsResponse>(
+  const result = await checkedResult<RawRowsResponse>(
     sendDatabaseMessage('database.query', {
       destination,
       requestId: randomUUID(),
@@ -161,7 +181,7 @@ async function getBucket(
     })
   )
 
-  return result.rows[0]
+  return decodeRows<BucketResponse>(result)[0]
 }
 
 async function insertBucket(bucketName: string, destination = testDestination()): Promise<unknown> {
@@ -328,7 +348,7 @@ describe('Database Watt application loopback integration', () => {
     const response = await queryDatabaseWatt()
     const stats = await getDatabaseWattStats()
 
-    expect(response.rows[0]).toEqual({ value: 1 })
+    expect(decodeRows(response)[0]).toEqual({ value: 1 })
     expect(stats.query).toBeGreaterThanOrEqual(1)
   })
 
@@ -408,6 +428,112 @@ describe('Database Watt application loopback integration', () => {
 
     expect(response).toMatchObject({ code: expect.any(String) })
     expect(stats.cancel).toBeGreaterThanOrEqual(1)
+  })
+
+  it('runs a whole scoped transaction from one batch message', async () => {
+    const bucketName = uniqueBucketName('dbwatt-batch')
+
+    try {
+      const response = await checkedResult<BatchResponse>(
+        sendDatabaseMessage('database.batch', {
+          destination: testDestination(),
+          requestId: randomUUID(),
+          statements: [
+            { sql: `SELECT set_config('storage.operation', $1, true)`, values: ['batch-test'] },
+            {
+              sql: `INSERT INTO storage.buckets (id, name, owner, public) VALUES ($1, $1, $2, false)
+                    RETURNING id, public, created_at, current_setting('storage.operation') AS operation`,
+              values: [bucketName, randomUUID()],
+            },
+          ],
+          commit: true,
+        })
+      )
+      const stats = await getDatabaseWattStats()
+      const [row] = decodeRows<{
+        id: string
+        public: boolean
+        created_at: Date
+        operation: string
+      }>(response)
+
+      expect(response.lockId).toBeUndefined()
+      expect(row).toMatchObject({ id: bucketName, public: false, operation: 'batch-test' })
+      expect(row.created_at).toBeInstanceOf(Date)
+      expect(await getBucket(bucketName)).toMatchObject({ id: bucketName })
+      expect(stats.batch).toBe(1)
+      expect(stats.beginTransaction).toBe(0)
+      expect(stats.commitTransaction).toBe(0)
+    } finally {
+      await cleanupBucket(bucketName)
+    }
+  })
+
+  it('opens a transaction from a batch message and continues it by lock', async () => {
+    const bucketName = uniqueBucketName('dbwatt-batch-open')
+
+    try {
+      const opened = await checkedResult<BatchResponse>(
+        sendDatabaseMessage('database.batch', {
+          destination: testDestination(),
+          requestId: randomUUID(),
+          isolationLevel: 'repeatable read',
+          statements: [
+            {
+              sql: `INSERT INTO storage.buckets (id, name, owner, public) VALUES ($1, $1, $2, false)`,
+              values: [bucketName, randomUUID()],
+            },
+          ],
+          commit: false,
+        })
+      )
+
+      expect(opened.lockId).toEqual(expect.any(String))
+      // Not visible outside the transaction until it commits.
+      expect(await getBucket(bucketName)).toBeUndefined()
+
+      const isolation = await checkedResult<RawRowsResponse>(
+        sendDatabaseMessage('database.lockedQuery', {
+          lockId: opened.lockId,
+          requestId: randomUUID(),
+          sql: 'SHOW transaction_isolation',
+        })
+      )
+      expect(decodeRows(isolation)[0]).toEqual({ transaction_isolation: 'repeatable read' })
+
+      await checkedResult(
+        sendDatabaseMessage('database.commitTransaction', { lockId: opened.lockId })
+      )
+      expect(await getBucket(bucketName)).toMatchObject({ id: bucketName })
+    } finally {
+      await cleanupBucket(bucketName)
+    }
+  })
+
+  it('rolls back a failed batch and leaves no partial state', async () => {
+    const bucketName = uniqueBucketName('dbwatt-batch-fail')
+
+    const response = (await sendDatabaseMessage('database.batch', {
+      destination: testDestination(),
+      requestId: randomUUID(),
+      statements: [
+        {
+          sql: `INSERT INTO storage.buckets (id, name, owner, public) VALUES ($1, $1, $2, false)`,
+          values: [bucketName, randomUUID()],
+        },
+        { sql: 'SELECT * FROM storage.does_not_exist' },
+      ],
+      commit: true,
+    })) as ErrorResponse & { connectionDiscarded?: boolean }
+
+    expect(response).toMatchObject({
+      code: 'POSTGRES_ERROR',
+      sqlState: '42P01',
+      connectionDiscarded: true,
+    })
+    expect(await getBucket(bucketName)).toBeUndefined()
+    // The pooled connection is clean again, not stuck in an aborted transaction.
+    expect(decodeRows(await queryDatabaseWatt())[0]).toEqual({ value: 1 })
   })
 
   it('handles concurrent Database Watt query load', async () => {
