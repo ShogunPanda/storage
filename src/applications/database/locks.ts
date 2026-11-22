@@ -1,5 +1,5 @@
-import { randomBytes } from 'node:crypto'
 import { isConnectionStateError } from '@internal/database/postgres/pool-errors'
+import hyperid from 'hyperid'
 import type { PoolClient } from 'pg'
 import type { StorageConfigType } from '../../config.js'
 import { DatabaseWattError } from './errors.js'
@@ -22,11 +22,11 @@ export class LockRegistry {
   private readonly config: StorageConfigType
   private readonly locks = new Map<string, LockRecord>()
   private readonly cleanupInterval: NodeJS.Timeout
-  // Lock IDs are a random prefix per registry plus a counter: unique across restarts of
-  // the Database application without generating random bytes for every transaction.
-  // They are not secrets: a lock can only be used through the channel that created it.
-  private readonly lockIdPrefix = randomBytes(12).toString('base64url') + '.'
-  private lockIdCounter = 0
+  // Lock IDs come from hyperid, a random UUID per registry plus a counter: unique across
+  // restarts of the Database application without generating random bytes for every
+  // transaction. They are not secrets: a lock can only be used through the channel that
+  // created it.
+  private readonly nextLockId = hyperid()
 
   constructor(config: StorageConfigType) {
     this.config = config
@@ -45,7 +45,7 @@ export class LockRegistry {
     inTransaction: boolean,
     owner: object
   ): string {
-    const lockId = this.lockIdPrefix + ++this.lockIdCounter
+    const lockId = this.nextLockId()
     const now = Date.now()
     this.locks.set(lockId, {
       busy: Promise.resolve(),

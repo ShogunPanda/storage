@@ -1,3 +1,4 @@
+import hyperid from 'hyperid'
 import { describe, expect, it, vi } from 'vitest'
 import { getConfig } from '../../config.js'
 import { DatabaseWattError } from './errors.js'
@@ -197,7 +198,7 @@ describe('database lock registry', () => {
 
     expect(new Set(ids).size).toBe(3)
     // A restarted Database application must not reuse the lock IDs of the previous one.
-    expect(ids[2].split('.')[0]).not.toBe(ids[0].split('.')[0])
+    expect(hyperid.decode(ids[2]).uuid).not.toBe(hyperid.decode(ids[0]).uuid)
     await first.close()
     await second.close()
   })
