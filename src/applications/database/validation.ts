@@ -67,6 +67,10 @@ export function validateBatchEnvelope(request: unknown): void {
       throw new DatabaseWattError('PROTOCOL_ERROR', 'each statement must be an object')
     }
     validateQueryEnvelope(statement)
+    const result = (statement as { result?: unknown }).result
+    if (result !== undefined && typeof result !== 'boolean') {
+      throw new DatabaseWattError('PROTOCOL_ERROR', 'result must be a boolean when present')
+    }
   }
 
   if (typeof commit !== 'boolean') {

@@ -424,6 +424,31 @@ describe('database Watt application messaging handlers', () => {
     expect(clients[0].release.mock.calls[0][0]).toBeUndefined()
   })
 
+  it('returns the results of the batch statements flagged with result', async () => {
+    const { clients, messaging } = await loadApp()
+
+    const response = await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [
+        { sql: 'SELECT set_config($1, $2, true)', values: ['role', 'service_role'] },
+        { sql: 'SELECT 1', result: true },
+        { sql: 'SELECT set_config($1, $2, true)', values: ['role', 'authenticated'] },
+        { sql: 'SELECT 2' },
+      ],
+      commit: true,
+    })
+
+    expect(response).toEqual({ ...okResponse, results: [okResponse] })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual([
+      'BEGIN',
+      'SELECT set_config($1, $2, true)',
+      'SELECT 1',
+      'SELECT set_config($1, $2, true)',
+      'SELECT 2',
+      'COMMIT',
+    ])
+  })
+
   it('opens a transaction from a batch message and keeps it pinned', async () => {
     const { clients, messaging } = await loadApp()
 
@@ -498,6 +523,7 @@ describe('database Watt application messaging handlers', () => {
     [{ statements: [] }, 'statements must be a non-empty array'],
     [{ statements: [{ sql: 1 }] }, 'sql must be a string'],
     [{ statements: [{ sql: 'SELECT 1' }], commit: 'yes' }, 'commit must be a boolean'],
+    [{ statements: [{ sql: 'SELECT 1', result: 1 }] }, 'result must be a boolean when present'],
   ])('rejects malformed batch requests %o', async (overrides, message) => {
     const { clients, messaging } = await loadApp()
 

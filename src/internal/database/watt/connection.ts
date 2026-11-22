@@ -13,6 +13,7 @@ import {
   DatabaseStatement,
   DatabaseTransaction,
   DatabaseTransactionalExecutor,
+  ScopedStatement,
   TenantConnection,
   TransactionOptions,
 } from '../connection'
@@ -372,6 +373,31 @@ export class WattPgExecutor implements DatabaseTransactionalExecutor {
     )
   }
 
+  /**
+   * Runs `statements` as one committed transaction with a single message. Returns the
+   * results of the statements flagged with `result`, then the last statement's.
+   */
+  async batchResults(
+    statements: BatchStatement[],
+    signal: AbortSignal | undefined
+  ): Promise<QueryResult[]> {
+    const response = await withPgErrors(
+      this.transport.batch(
+        {
+          ...this.getTransactionStart(undefined),
+          operationName: this.operation?.(),
+          statements,
+          commit: true,
+        },
+        { signal }
+      )
+    )
+
+    const results = (response.results ?? []).map((result) => toPgQueryResult(result))
+    results.push(toPgQueryResult(response))
+    return results
+  }
+
   private getTransactionStart(options: TransactionOptions | undefined): WattTransactionStart {
     return {
       destination: this.destination,
@@ -469,14 +495,7 @@ export class WattPgTenantConnection implements TenantConnection {
       pendingSearchPath = tnx.takePendingSearchPath()
     }
 
-    const scope = buildScopeStatement(
-      this.options,
-      this.role,
-      this.getUserPayload(),
-      this.headersPayload,
-      statementTimeoutMs,
-      pendingSearchPath
-    )
+    const scope = this.buildScope(statementTimeoutMs, pendingSearchPath)
 
     // Before the transaction has started, the scope rides along with its first query.
     if (tnx instanceof WattPgTransaction && !tnx.isStarted()) {
@@ -493,11 +512,7 @@ export class WattPgTenantConnection implements TenantConnection {
    */
   singleStatementExecutor(options?: TransactionOptions): DatabaseExecutor {
     this.assertNotAborted()
-    const scope = buildScopeStatement(
-      this.options,
-      this.role,
-      this.getUserPayload(),
-      this.headersPayload,
+    const scope = this.buildScope(
       options?.timeout !== undefined
         ? normalizeStatementTimeoutMs(options.timeout)
         : defaultStatementTimeoutMs,
@@ -505,6 +520,68 @@ export class WattPgTenantConnection implements TenantConnection {
     )
 
     return this.executor.singleStatement(options, [{ sql: scope.text, values: scope.values }])
+  }
+
+  /**
+   * Runs `statements` as one transaction in one message: BEGIN, the same settings
+   * singleStatementExecutor() applies, then each statement after the scope it asks for
+   * (this connection's or the super user's), then COMMIT. Scope statements set the same
+   * keys, so each one fully replaces the one before it.
+   */
+  async scopedBatch(statements: ScopedStatement[]): Promise<QueryResult[]> {
+    this.assertNotAborted()
+    if (statements.length === 0) {
+      return []
+    }
+
+    const superUser = statements.some((statement) => statement.asSuperUser)
+      ? new WattPgTenantConnection(
+          { ...this.options, user: this.options.superUser },
+          this.transport,
+          this.headersPayload
+        )
+      : undefined
+
+    const batch: BatchStatement[] = []
+    const last = statements.length - 1
+    let applied: WattPgTenantConnection | undefined
+    for (let i = 0; i <= last; i++) {
+      const statement = statements[i]
+      const scoped = statement.asSuperUser ? (superUser as WattPgTenantConnection) : this
+      if (scoped !== applied) {
+        // Transaction-wide settings only need to be set once.
+        const scope = applied
+          ? scoped.buildScope(undefined, undefined)
+          : scoped.buildScope(
+              defaultStatementTimeoutMs,
+              this.options.isExternalPool ? externalPoolSearchPath : undefined
+            )
+        batch.push({ sql: scope.text, values: scope.values })
+        applied = scoped
+      }
+      // The last statement's result is the response itself.
+      batch.push(
+        i < last
+          ? { sql: statement.text, values: statement.values, result: true }
+          : { sql: statement.text, values: statement.values }
+      )
+    }
+
+    return this.executor.batchResults(batch, this.wattAbortSignal)
+  }
+
+  private buildScope(
+    statementTimeoutMs: number | undefined,
+    pendingSearchPath: string | undefined
+  ) {
+    return buildScopeStatement(
+      this.options,
+      this.role,
+      this.getUserPayload(),
+      this.headersPayload,
+      statementTimeoutMs,
+      pendingSearchPath
+    )
   }
 
   private getUserPayload(): string {

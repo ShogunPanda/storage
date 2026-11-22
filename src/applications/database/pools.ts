@@ -9,7 +9,12 @@ import { getLogger } from '@platformatic/globals'
 import { Pool, type PoolClient, type QueryResult } from 'pg'
 import type { StorageConfigType } from '../../config.js'
 import { DatabaseWattError } from './errors.js'
-import type { BatchStatement, DatabasePoolTarget, RawQueryResponse } from './protocol.js'
+import type {
+  BatchResponse,
+  BatchStatement,
+  DatabasePoolTarget,
+  RawQueryResponse,
+} from './protocol.js'
 
 // pg type parsers are module-global and this application runs in its own worker
 // thread, so they have to be installed here as well as in the storage workers.
@@ -383,6 +388,24 @@ export function toQueryResponse(result: QueryResult<RawRow>): RawQueryResponse {
   }
 }
 
+/**
+ * The response to a batch: the last statement's result, plus the results of the
+ * statements flagged with `result`, in order.
+ */
+export function toBatchResponse(
+  statements: BatchStatement[],
+  results: QueryResult<RawRow>[]
+): BatchResponse {
+  const response: BatchResponse = toQueryResponse(results[results.length - 1])
+  for (let i = 0; i < statements.length; i++) {
+    if (statements[i].result) {
+      response.results ??= []
+      response.results.push(toQueryResponse(results[i]))
+    }
+  }
+  return response
+}
+
 export class BeginError extends Error {
   constructor(readonly original: unknown) {
     super(original instanceof Error ? original.message : String(original), { cause: original })
@@ -392,7 +415,7 @@ export class BeginError extends Error {
 
 /**
  * Runs BEGIN, `statements` and, when asked, COMMIT on one connection, returning the
- * result of the last statement. A failed BEGIN is thrown as a BeginError so callers can
+ * result of every statement, in order. A failed BEGIN is thrown as a BeginError so callers can
  * retry it on another connection: nothing ran yet.
  *
  * On a pipelining client everything is written at once (one socket write, one round
@@ -404,7 +427,7 @@ export async function runBatch(
   beginStatement: string,
   statements: BatchStatement[],
   commit: boolean
-): Promise<QueryResult<RawRow>> {
+): Promise<QueryResult<RawRow>[]> {
   if ((client as PoolClient & { pipeline?: boolean }).pipeline) {
     return runPipelinedBatch(client, beginStatement, statements, commit)
   }
@@ -415,16 +438,16 @@ export async function runBatch(
     throw new BeginError(error)
   }
 
-  let result: QueryResult<RawRow> | undefined
-  for (const statement of statements) {
-    result = await runQuery(client, statement.sql, statement.values)
+  const results = new Array<QueryResult<RawRow>>(statements.length)
+  for (let i = 0; i < statements.length; i++) {
+    results[i] = await runQuery(client, statements[i].sql, statements[i].values)
   }
 
   if (commit) {
     await client.query('COMMIT')
   }
 
-  return result as QueryResult<RawRow>
+  return results
 }
 
 async function runPipelinedBatch(
@@ -432,7 +455,7 @@ async function runPipelinedBatch(
   beginStatement: string,
   statements: BatchStatement[],
   commit: boolean
-): Promise<QueryResult<RawRow>> {
+): Promise<QueryResult<RawRow>[]> {
   const stream = (
     client as PoolClient & {
       connection?: { stream?: Partial<NodeJS.WritableStream> & { cork?(): void; uncork?(): void } }
@@ -467,5 +490,10 @@ async function runPipelinedBatch(
     }
   }
 
-  return (settled[statements.length] as PromiseFulfilledResult<QueryResult<RawRow>>).value
+  const results = new Array<QueryResult<RawRow>>(statements.length)
+  for (let i = 0; i < statements.length; i++) {
+    // settled[0] is BEGIN.
+    results[i] = (settled[i + 1] as PromiseFulfilledResult<QueryResult<RawRow>>).value
+  }
+  return results
 }

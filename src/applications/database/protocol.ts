@@ -139,13 +139,16 @@ export type RawQueryResponse = {
 export type BatchStatement = {
   sql: string
   values?: unknown[]
+  /** Also return this statement's result, in the response's `results`. */
+  result?: boolean
 }
 
 /**
  * Opens a transaction and runs `statements` in it with one message. With `commit` the
  * transaction is committed and its connection released (a whole single-statement
  * transaction); without it the transaction stays open and its lock ID is returned.
- * The response carries the result of the last statement.
+ * The response carries the result of the last statement, plus, in `results`, the
+ * results of the statements flagged with `result`, in order.
  */
 export type BatchRequest = WireRequestMeta & {
   destination: DatabasePoolTarget
@@ -157,6 +160,7 @@ export type BatchRequest = WireRequestMeta & {
 
 export type BatchResponse = RawQueryResponse & {
   lockId?: string
+  results?: RawQueryResponse[]
 }
 
 export type DatabaseProtocol = {

@@ -298,6 +298,80 @@ describe('Watt PostgreSQL connection adapter', () => {
     )
   })
 
+  it('runs scoped statements as one batch message and returns every result', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': {
+        rowCount: 1,
+        fields: [{ name: 'name', dataTypeID: 25 }],
+        rows: [['object-a']],
+        results: [{ rowCount: 1, fields: [{ name: 'id', dataTypeID: 25 }], rows: [['bucket-a']] }],
+      },
+    })
+    const connection = await getWattPostgresConnection({
+      ...createConnectionOptions(),
+      isExternalPool: true,
+    })
+
+    const results = await connection.scopedBatch?.([
+      { text: 'SELECT id FROM storage.buckets', values: ['bucket-a'], asSuperUser: true },
+      { text: 'SELECT name FROM storage.objects', values: ['object-a'] },
+    ])
+
+    expect(results?.map((result) => result.rows)).toEqual([
+      [{ id: 'bucket-a' }],
+      [{ name: 'object-a' }],
+    ])
+    expect(sent.map((message) => message.message)).toEqual(['database.batch'])
+    expect(sent[0].data).toMatchObject({ commit: true, destination: { isExternalPool: true } })
+    const statements = sent[0].data.statements as Array<{
+      sql: string
+      values: unknown[]
+      result?: boolean
+    }>
+    expect(statements).toHaveLength(4)
+    // The super user's scope, with the transaction-wide settings.
+    expect(statements[0].values.slice(0, 3)).toEqual([
+      'service_role',
+      'service_role',
+      'service-jwt',
+    ])
+    expect(statements[0].sql).toContain("set_config('statement_timeout'")
+    expect(statements[0].sql).toContain("set_config('search_path'")
+    expect(statements[1]).toEqual({
+      sql: 'SELECT id FROM storage.buckets',
+      values: ['bucket-a'],
+      result: true,
+    })
+    // The caller's scope replaces it, and the settings are not sent twice.
+    expect(statements[2].values.slice(0, 3)).toEqual(['authenticated', 'authenticated', 'user-jwt'])
+    expect(statements[2].sql).not.toContain('statement_timeout')
+    expect(statements[2].sql).not.toContain('search_path')
+    // The last result is the response itself.
+    expect(statements[3]).toStrictEqual({
+      sql: 'SELECT name FROM storage.objects',
+      values: ['object-a'],
+    })
+  })
+
+  it('sends one scope for consecutive scoped statements with the same scope', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': { rowCount: 0, rows: [], results: [{ rowCount: 0, rows: [] }] },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+
+    const results = await connection.scopedBatch?.([
+      { text: 'SELECT 1', asSuperUser: true },
+      { text: 'SELECT 2', asSuperUser: true },
+    ])
+
+    expect(results).toHaveLength(2)
+    const statements = sent[0].data.statements as Array<{ sql: string; values?: unknown[] }>
+    expect(statements).toHaveLength(3)
+    expect(statements[0].sql).toContain("set_config('role', $1, true)")
+    expect(statements[0].values?.[0]).toBe('service_role')
+    expect(statements.slice(1).map((statement) => statement.sql)).toEqual(['SELECT 1', 'SELECT 2'])
+  })
+
   it('parses raw rows with the pg type parsers', async () => {
     installWattMessagingMock({
       'database.query': {

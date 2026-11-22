@@ -4,7 +4,14 @@ import { setupLoopbackMessaging } from '@platformatic/runtime'
 import { types } from 'pg'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { getConfig } from '../../config.js'
-import type { DatabasePoolTarget } from './protocol.js'
+import { DBMigration } from '../../internal/database/migrations/types.js'
+import {
+  DatabaseWattResponseError,
+  type DatabaseWattTransport,
+} from '../../internal/database/watt/client.js'
+import { getWattPostgresConnection } from '../../internal/database/watt/connection.js'
+import { StoragePgDB } from '../../storage/database/pg.js'
+import type { DatabaseErrorResponse, DatabasePoolTarget } from './protocol.js'
 
 type ApplicationContext = {
   close: () => Promise<void>
@@ -47,7 +54,7 @@ type RawRowsResponse = {
 
 type QueryRowsResponse = RawRowsResponse
 
-type BatchResponse = RawRowsResponse & { lockId?: string }
+type BatchResponse = RawRowsResponse & { lockId?: string; results?: RawRowsResponse[] }
 
 function decodeRows<T>(response: RawRowsResponse): T[] {
   return response.rows.map(
@@ -97,6 +104,36 @@ function testDestination(): DatabasePoolTarget {
     isExternalPool: Boolean(databasePoolURL),
     maxConnections: databaseMaxConnections,
   }
+}
+
+// The global messaging is the Database application's side of the loopback, so a storage
+// worker connection sends through the test's side instead.
+function loopbackTransport(): DatabaseWattTransport {
+  const sender =
+    (message: string) =>
+    async (request: object): Promise<never> => {
+      const response = await sendDatabaseMessage(message, { requestId: randomUUID(), ...request })
+      if (isDatabaseError(response)) {
+        throw new DatabaseWattResponseError(response as DatabaseErrorResponse)
+      }
+      return response as never
+    }
+
+  return {
+    query: sender('database.query'),
+    acquire: sender('database.acquire'),
+    batch: sender('database.batch'),
+    lockedQuery: sender('database.lockedQuery'),
+    release: sender('database.release'),
+    beginTransaction: sender('database.beginTransaction'),
+    commitTransaction: sender('database.commitTransaction'),
+    rollbackTransaction: sender('database.rollbackTransaction'),
+  }
+}
+
+function latestDBMigration(): keyof typeof DBMigration {
+  const names = Object.keys(DBMigration) as Array<keyof typeof DBMigration>
+  return names.reduce((latest, name) => (DBMigration[name] > DBMigration[latest] ? name : latest))
 }
 
 function uniqueBucketName(kind: string): string {
@@ -466,6 +503,109 @@ describe('Database Watt application loopback integration', () => {
       expect(stats.commitTransaction).toBe(0)
     } finally {
       await cleanupBucket(bucketName)
+    }
+  })
+
+  it('returns each flagged batch statement result, read under the scope before it', async () => {
+    const response = await checkedResult<BatchResponse>(
+      sendDatabaseMessage('database.batch', {
+        destination: testDestination(),
+        requestId: randomUUID(),
+        statements: [
+          { sql: `SELECT set_config('storage.operation', $1, true)`, values: ['first'] },
+          { sql: `SELECT current_setting('storage.operation') AS operation`, result: true },
+          { sql: `SELECT set_config('storage.operation', $1, true)`, values: ['second'] },
+          { sql: `SELECT current_setting('storage.operation') AS operation` },
+        ],
+        commit: true,
+      })
+    )
+
+    expect(response.lockId).toBeUndefined()
+    expect(response.results).toHaveLength(1)
+    expect(decodeRows<{ operation: string }>(response.results?.[0] as BatchResponse)).toEqual([
+      { operation: 'first' },
+    ])
+    expect(decodeRows<{ operation: string }>(response)).toEqual([{ operation: 'second' }])
+  })
+
+  it('reads a bucket and an object in one batch with the results of the regular reads', async () => {
+    const bucketName = uniqueBucketName('dbwatt-pair')
+    const destination = testDestination()
+    const connection = await getWattPostgresConnection(
+      {
+        dbUrl: destination.connectionString,
+        isExternalPool: destination.isExternalPool,
+        maxConnections: destination.maxConnections,
+        tenantId: destination.id,
+        operation: () => 'storage.object.get',
+        superUser: { jwt: '', payload: { role: 'service_role' } },
+        user: { jwt: '', payload: { role: 'authenticated', sub: randomUUID() } },
+      },
+      loopbackTransport()
+    )
+    const db = new StoragePgDB(connection, {
+      tenantId: destination.id,
+      host: 'localhost',
+      latestMigration: latestDBMigration(),
+    })
+    const query = {
+      bucketId: bucketName,
+      bucketColumns: 'id,public',
+      objectName: 'folder/a.txt',
+      objectColumns: 'id,name,version',
+      objectFilters: { excludeDeleteMarkers: true },
+    }
+
+    try {
+      await checkedResult(
+        sendDatabaseMessage('database.batch', {
+          destination,
+          statements: [
+            {
+              sql: `INSERT INTO storage.buckets (id, name, public) VALUES ($1, $1, false)`,
+              values: [bucketName],
+            },
+            {
+              sql: `INSERT INTO storage.objects (bucket_id, name, version) VALUES ($1, $2, $3)`,
+              values: [bucketName, query.objectName, randomUUID()],
+            },
+          ],
+          commit: true,
+        })
+      )
+      await resetDatabaseWattStats()
+
+      const withRls = await db.findBucketAndObject({ ...query, objectAsSuperUser: false })
+      const asSuperUser = await db.findBucketAndObject({ ...query, objectAsSuperUser: true })
+      const stats = await getDatabaseWattStats()
+
+      expect(stats.batch).toBe(2)
+      expect(stats.query + stats.beginTransaction + stats.lockedQuery).toBe(0)
+      expect(withRls?.bucket).toEqual({ id: bucketName, public: false })
+      expect(asSuperUser?.bucket).toEqual({ id: bucketName, public: false })
+      const regularRead = { excludeDeleteMarkers: true, dontErrorOnEmpty: true }
+      expect(withRls?.object).toEqual(
+        await db.findObject(bucketName, query.objectName, query.objectColumns, regularRead)
+      )
+      expect(asSuperUser?.object).toEqual(
+        await db
+          .asSuperUser()
+          .findObject(bucketName, query.objectName, query.objectColumns, regularRead)
+      )
+      expect(asSuperUser?.object).toMatchObject({ name: query.objectName })
+    } finally {
+      await checkedResult(
+        sendDatabaseMessage('database.batch', {
+          destination,
+          statements: [
+            { sql: `SELECT set_config('storage.allow_delete_query', 'true', true)` },
+            { sql: 'DELETE FROM storage.objects WHERE bucket_id = $1', values: [bucketName] },
+            { sql: 'DELETE FROM storage.buckets WHERE id = $1', values: [bucketName] },
+          ],
+          commit: true,
+        })
+      )
     }
   })
 

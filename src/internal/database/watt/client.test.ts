@@ -82,6 +82,20 @@ describe('Database Watt client transport', () => {
     })
   })
 
+  it.each([
+    ['not an array', { rowCount: 0, rows: [], results: {} }],
+    ['a malformed result', { rowCount: 0, rows: [], results: [{ rowCount: '1', rows: [] }] }],
+  ])('rejects batch responses whose results are %s', async (_, response) => {
+    installWattMessagingMock({ 'database.batch': response })
+    const client = new DatabaseWattClient()
+
+    const error = await client
+      .batch({ destination: createDestination(), statements: [{ sql: 'SELECT 1' }], commit: true })
+      .catch((error: unknown) => error)
+
+    expect(error).toBeInstanceOf(DatabaseWattProtocolError)
+  })
+
   it('cancels a lock-bound request with the same request and lock ids', async () => {
     let resolveQuery!: (value: unknown) => void
     const { sent } = installWattMessagingMock({

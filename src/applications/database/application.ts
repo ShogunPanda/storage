@@ -14,7 +14,7 @@ import { CancellationRegistry } from './cancellation.js'
 import { DatabaseWattError, type ErrorContext, toErrorResponse } from './errors.js'
 import { LockRegistry } from './locks.js'
 import { registerDatabaseWattMetrics } from './metrics.js'
-import { BeginError, PoolRegistry, runBatch, toQueryResponse } from './pools.js'
+import { BeginError, PoolRegistry, runBatch, toBatchResponse } from './pools.js'
 import {
   type AcquireConnectionRequest,
   type BatchRequest,
@@ -333,17 +333,15 @@ export class Application {
       this.#cancellations.start(request.requestId, { cancelled: false })
       cancellationRequestId = request.requestId
 
-      const { client, result } = await this.#runBatchWithRetry(request)
+      const { client, results } = await this.#runBatchWithRetry(request)
+      const response = toBatchResponse(request.statements, results)
 
       if (request.commit) {
         client.release()
-        return toQueryResponse(result)
+        return response
       }
 
       const owner = this.#trackOwner(context)
-      const response = toQueryResponse(result) as ReturnType<typeof toQueryResponse> & {
-        lockId?: string
-      }
       response.lockId = this.#locks.create(request.destination, client, true, owner)
       return response
     } catch (error) {
@@ -372,8 +370,8 @@ export class Application {
       this.#cancellations.setClient(request.requestId, client)
 
       try {
-        const result = await runBatch(client, beginStatement, request.statements, request.commit)
-        return { client, result }
+        const results = await runBatch(client, beginStatement, request.statements, request.commit)
+        return { client, results }
       } catch (error) {
         if (!(error instanceof BeginError)) {
           await rollbackAndRelease(client, error)

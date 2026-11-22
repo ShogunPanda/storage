@@ -53,6 +53,8 @@ import {
   S3PartUpload,
 } from '../schemas'
 import {
+  BucketAndObject,
+  BucketAndObjectQuery,
   Database,
   DeleteMarkerOptions,
   FindBucketFilters,
@@ -684,34 +686,12 @@ export class StoragePgDB implements Database {
   }
 
   async findBucketById(bucketId: string, columns = 'id', filters?: FindBucketFilters) {
-    const selectedColumns = selectColumns(columns, await this.getBucketColumnPolicy())
+    const statement = await this.findBucketByIdStatement(bucketId, columns, filters)
 
     const result = await this.runQuery(
       'FindBucketById',
       async (db, signal) => {
-        const conditions = ['id = $1']
-        const values: unknown[] = [bucketId]
-
-        if (typeof filters?.isPublic !== 'undefined') {
-          values.push(filters.isPublic)
-          conditions.push(`public = $${values.length}`)
-        }
-
-        const result = await this.query<Bucket>(
-          db,
-          {
-            text: `
-            SELECT ${selectedColumns}
-            FROM storage.buckets
-            WHERE ${conditions.join(' AND ')}
-            LIMIT 1
-            ${lockClause(filters)}
-          `,
-            values,
-          },
-          signal
-        )
-
+        const result = await this.query<Bucket>(db, statement, signal)
         return result.rows[0]
       },
       { singleStatement: true }
@@ -722,6 +702,77 @@ export class StoragePgDB implements Database {
     }
 
     return result
+  }
+
+  private async findBucketByIdStatement(
+    bucketId: string,
+    columns: string,
+    filters?: FindBucketFilters
+  ): Promise<DatabaseStatement> {
+    const selectedColumns = selectColumns(columns, await this.getBucketColumnPolicy())
+    const conditions = ['id = $1']
+    const values: unknown[] = [bucketId]
+
+    if (typeof filters?.isPublic !== 'undefined') {
+      values.push(filters.isPublic)
+      conditions.push(`public = $${values.length}`)
+    }
+
+    return {
+      text: `
+            SELECT ${selectedColumns}
+            FROM storage.buckets
+            WHERE ${conditions.join(' AND ')}
+            LIMIT 1
+            ${lockClause(filters)}
+          `,
+      values,
+    }
+  }
+
+  /**
+   * Reads a bucket with the super user's scope and an object in it with the super user's
+   * scope (`objectAsSuperUser`) or this database's, in one round trip on connections that
+   * support it (Database Watt). It resolves to undefined when the connection cannot, inside
+   * a transaction, and when the batch fails in a way that findBucketById followed by
+   * findObject might not: callers then take that path, which gives the regular outcome.
+   */
+  async findBucketAndObject(query: BucketAndObjectQuery): Promise<BucketAndObject | undefined> {
+    if (!this.connection.scopedBatch || this.options.tnx || this.options.parentTnx) {
+      return undefined
+    }
+
+    const [bucketStatement, objectStatement] = await Promise.all([
+      this.findBucketByIdStatement(query.bucketId, query.bucketColumns),
+      this.findObjectStatement(
+        query.bucketId,
+        query.objectName,
+        query.objectColumns,
+        query.objectFilters,
+        query.version
+      ),
+    ])
+
+    const queryName = 'FindBucketAndObject'
+    const abortSignal = this.connection.getAbortSignal()
+    const recordDuration = this.createDurationRecorder(queryName, performance.now(), abortSignal)
+    try {
+      const [buckets, objects] = await this.connection.scopedBatch([
+        { ...bucketStatement, asSuperUser: true },
+        { ...objectStatement, asSuperUser: query.objectAsSuperUser },
+      ])
+      return {
+        bucket: buckets.rows[0] as Bucket | undefined,
+        object: objects.rows[0] as Obj | undefined,
+      }
+    } catch (e) {
+      if (regularPathMayDiffer(e)) {
+        return undefined
+      }
+      throw mapPgErrorWithQueryName(e, queryName)
+    } finally {
+      recordDuration()
+    }
   }
 
   /**
@@ -2096,6 +2147,37 @@ export class StoragePgDB implements Database {
     filters?: FindObjectFilters,
     version?: string | null
   ) {
+    const statement = await this.findObjectStatement(
+      bucketId,
+      objectName,
+      columns,
+      filters,
+      version
+    )
+
+    const result = await this.runQuery(
+      'FindObject',
+      async (db, signal) => {
+        return this.query<Obj>(db, statement, signal)
+      },
+      { singleStatement: true }
+    )
+
+    const object = result.rows[0]
+    if (!object && !filters?.dontErrorOnEmpty) {
+      throw ERRORS.NoSuchKey(objectName)
+    }
+
+    return object
+  }
+
+  private async findObjectStatement(
+    bucketId: string,
+    objectName: string,
+    columns: string,
+    filters?: FindObjectFilters,
+    version?: string | null
+  ): Promise<DatabaseStatement> {
     const selectedColumns = selectColumns(columns, await this.getObjectColumnPolicy())
     const conditions = ['name COLLATE "C" = $1', 'bucket_id = $2']
     const values: unknown[] = [objectName, bucketId]
@@ -2117,33 +2199,16 @@ export class StoragePgDB implements Database {
       conditions.push(`is_versioned = $${values.length}`)
     }
 
-    const result = await this.runQuery(
-      'FindObject',
-      async (db, signal) => {
-        return this.query<Obj>(
-          db,
-          {
-            text: `
+    return {
+      text: `
             SELECT ${selectedColumns}
             FROM storage.objects
             WHERE ${conditions.join(' AND ')}
             LIMIT 1
             ${objectLockClause(filters)}
           `,
-            values,
-          },
-          signal
-        )
-      },
-      { singleStatement: true }
-    )
-
-    const object = result.rows[0]
-    if (!object && !filters?.dontErrorOnEmpty) {
-      throw ERRORS.NoSuchKey(objectName)
+      values,
     }
-
-    return object
   }
 
   async findObjects(
@@ -4113,6 +4178,21 @@ function mapPgError(error: unknown, context?: string | PgErrorContext): unknown 
   }
 
   return error
+}
+
+/**
+ * Whether a failed findBucketAndObject batch may have failed where findBucketById followed
+ * by findObject would not: the batch reads the object even when the bucket read alone
+ * would have ended the request, and it can be refused a scope that the regular path never
+ * applies. Connection, resource and cancellation errors (statement timeouts included) would
+ * fail the regular path as well, so they are thrown instead of retried that way.
+ */
+function regularPathMayDiffer(error: unknown): boolean {
+  if (error instanceof DatabaseError) {
+    const code = error.code ?? ''
+    return !code.startsWith('08') && !code.startsWith('53') && !code.startsWith('57')
+  }
+  return isStorageError(ErrorCode.AccessDenied, error)
 }
 
 function mapPgErrorWithQueryName(error: unknown, queryName: string): unknown {

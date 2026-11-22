@@ -34,7 +34,11 @@ export type DatabaseWattQueryResponse<Row = unknown> =
   | QueryResponse<Row>
   | (RawQueryResponse & { fields: QueryField[] })
 
-export type DatabaseWattBatchResponse = DatabaseWattQueryResponse & { lockId?: string }
+export type DatabaseWattBatchResponse = DatabaseWattQueryResponse & {
+  lockId?: string
+  /** The results of the statements flagged with `result`, in order. */
+  results?: DatabaseWattQueryResponse[]
+}
 
 // Request IDs key in-flight operations (for cancellation) in the Database application,
 // across every storage worker: a random prefix per thread plus a counter keeps them
@@ -267,9 +271,17 @@ function parseQueryResponse<Row>(response: unknown): DatabaseWattQueryResponse<R
 
 function parseBatchResponse(response: unknown): DatabaseWattBatchResponse {
   const parsed = parseQueryResponse(response) as DatabaseWattBatchResponse
-  const lockId = (response as { lockId?: unknown }).lockId
+  const { lockId, results } = response as { lockId?: unknown; results?: unknown }
   if (lockId !== undefined && typeof lockId !== 'string') {
     throw new DatabaseWattProtocolError('Invalid Database Watt batch response')
+  }
+  if (results !== undefined) {
+    if (!Array.isArray(results)) {
+      throw new DatabaseWattProtocolError('Invalid Database Watt batch response')
+    }
+    for (const result of results) {
+      parseQueryResponse(result)
+    }
   }
   return parsed
 }
