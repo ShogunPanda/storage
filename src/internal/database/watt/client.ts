@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto'
 import { getMessaging } from '@platformatic/globals'
+import hyperid from 'hyperid'
 import {
   type AcquireConnectionRequest,
   type AcquireConnectionResponse,
@@ -41,14 +41,9 @@ export type DatabaseWattBatchResponse = DatabaseWattQueryResponse & {
 }
 
 // Request IDs key in-flight operations (for cancellation) in the Database application,
-// across every storage worker: a random prefix per thread plus a counter keeps them
-// unique without a randomUUID() per message.
-const requestIdPrefix = `${randomUUID()}:`
-let requestIdCounter = 0
-
-export function nextRequestId(): string {
-  return requestIdPrefix + ++requestIdCounter
-}
+// across every storage worker. hyperid gives each thread a random UUID and counts from it,
+// so the IDs stay unique without generating random bytes for every message.
+const nextRequestId = hyperid()
 
 interface DatabaseWattSendOptions extends DatabaseWattRequestOptions {
   lockId?: string
