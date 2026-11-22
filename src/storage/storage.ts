@@ -1,3 +1,4 @@
+import { createLruCache } from '@internal/cache'
 import { tenantHasFeature } from '@internal/database'
 import { ERRORS, StorageBackendError } from '@internal/errors'
 import { logger, logSchema } from '@internal/monitoring'
@@ -41,20 +42,17 @@ export interface BucketObjectLookup {
   findObject(): Promise<Obj>
 }
 
-// The last seen public flag of buckets (by tenant and id) that findBucketAndObject read,
-// to pick the scope of its object read. A stale entry only costs a second object read.
-const publicBuckets = new Map<string, boolean>()
-const MAX_REMEMBERED_BUCKETS = 10_000
+// The public flag of the buckets findBucketAndObject last saw (by tenant and id), to
+// decide whether to read the object together with the bucket, and with which scope.
+// The least recently used are dropped first.
+const seenBuckets = createLruCache<string, boolean>({ max: 10_000 })
 
-function rememberBucketVisibility(key: string, bucket: Bucket | undefined): void {
-  if (!bucket) {
-    publicBuckets.delete(key)
-    return
+function rememberBucket(key: string, bucket: Bucket | undefined): void {
+  if (bucket) {
+    seenBuckets.set(key, Boolean(bucket.public))
+  } else {
+    seenBuckets.delete(key)
   }
-  if (publicBuckets.size >= MAX_REMEMBERED_BUCKETS && !publicBuckets.has(key)) {
-    publicBuckets.clear()
-  }
-  publicBuckets.set(key, Boolean(bucket.public))
 }
 
 /**
@@ -121,47 +119,50 @@ export class Storage {
    * as the super user (undefined when there is none), and `findObject()` returns the object
    * as ObjectStorage.findObject would (excluding delete markers, NoSuchKey when missing),
    * read as the super user when the bucket is public or `objectAsSuperUser` is set and with
-   * this storage's scope otherwise.
+   * this storage's scope otherwise. Callers check the bucket before calling findObject();
+   * `publicBucketOnly` says that they reject a bucket that is not public.
    *
    * That is what asSuperUser().findBucket() followed by findObject() gives, but where the
-   * database allows it both reads share one round trip. The object read's scope is then
-   * picked before the bucket is known, from the bucket's last seen public flag; a read
-   * done with the wrong scope is never used where the regular one could differ, and the
-   * object is read again instead.
+   * database allows it both reads share one round trip. The object is then read before the
+   * caller checks the bucket, so they share it only for a bucket seen before that existed
+   * and, with `publicBucketOnly`, was public: the object is read only where the regular
+   * reads would read it too, unless the bucket changed since. The same public flag picks
+   * the object read's scope; a read done with the wrong scope is never used where the
+   * regular one could differ, and the object is read again instead.
    */
   async findBucketAndObject(
     bucketId: string,
     objectName: string,
     objectColumns: string,
-    options: { version?: string; objectAsSuperUser?: boolean } = {}
+    options: { version?: string; objectAsSuperUser?: boolean; publicBucketOnly?: boolean } = {}
   ): Promise<BucketObjectLookup> {
     const forceSuperUser = options.objectAsSuperUser === true
-    const visibilityKey = `${this.db.tenantId}/${bucketId}`
-    const readAsSuperUser = forceSuperUser || publicBuckets.get(visibilityKey) === true
+    const seenKey = `${this.db.tenantId}/${bucketId}`
+    const seenPublic = seenBuckets.get(seenKey)
+    const readAsSuperUser = forceSuperUser || seenPublic === true
 
     // Invalid names fail in from() and findObject() only after the bucket is checked.
-    const batched =
-      isValidBucketName(bucketId) && isValidKey(objectName)
-        ? await this.db.findBucketAndObject({
-            bucketId,
-            bucketColumns: 'id,public',
-            objectName,
-            objectColumns,
-            objectFilters: { excludeDeleteMarkers: true },
-            version: options.version,
-            objectAsSuperUser: readAsSuperUser,
-          })
-        : undefined
+    const batch =
+      seenPublic !== undefined &&
+      (seenPublic || !options.publicBucketOnly) &&
+      isValidBucketName(bucketId) &&
+      isValidKey(objectName)
+    const batched = batch
+      ? await this.db.findBucketAndObject({
+          bucketId,
+          bucketColumns: 'id,public',
+          objectName,
+          objectColumns,
+          objectFilters: { excludeDeleteMarkers: true },
+          version: options.version,
+          objectAsSuperUser: readAsSuperUser,
+        })
+      : undefined
 
-    let bucket: Bucket | undefined
-    if (batched) {
-      bucket = batched.bucket
-      rememberBucketVisibility(visibilityKey, bucket)
-    } else {
-      bucket = await this.asSuperUser().findBucket(bucketId, 'id,public', {
-        dontErrorOnEmpty: true,
-      })
-    }
+    const bucket = batched
+      ? batched.bucket
+      : await this.asSuperUser().findBucket(bucketId, 'id,public', { dontErrorOnEmpty: true })
+    rememberBucket(seenKey, bucket)
 
     return {
       bucket,

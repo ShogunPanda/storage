@@ -50,7 +50,7 @@ async function requestHandler(request: GetObjectRequest, response: FastifyReply)
     bucketName,
     objectName,
     'id, version, metadata',
-    { version: versionId }
+    { version: versionId, publicBucketOnly: !request.isAuthenticated }
   )
   const bucket = lookup.bucket
 

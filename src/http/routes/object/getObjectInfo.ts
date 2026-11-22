@@ -60,6 +60,7 @@ async function requestHandler(
   const lookup = await request.storage.findBucketAndObject(bucketName, objectName, columns, {
     version: versionId,
     objectAsSuperUser: publicRoute,
+    publicBucketOnly: !request.isAuthenticated,
   })
   const bucket = lookup.bucket
 
