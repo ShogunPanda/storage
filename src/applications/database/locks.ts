@@ -14,7 +14,7 @@ type LockRecord = {
   inTransaction: boolean
   lastUsedAt: number
   lockId: string
-  owner?: object
+  owner: object
   terminal: boolean
 }
 
@@ -42,8 +42,8 @@ export class LockRegistry {
   create(
     destination: DatabasePoolTarget,
     client: PoolClient,
-    inTransaction = false,
-    owner?: object
+    inTransaction: boolean,
+    owner: object
   ): string {
     const lockId = this.lockIdPrefix + ++this.lockIdCounter
     const now = Date.now()
@@ -82,15 +82,15 @@ export class LockRegistry {
     return this.locks.get(lockId)?.destination.id
   }
 
-  getClient(lockId: string, owner?: object): PoolClient {
+  getClient(lockId: string, owner: object | undefined): PoolClient {
     return this.getLock(lockId, owner).client
   }
 
   async query(
     lockId: string,
     sql: string,
-    values?: unknown[],
-    owner?: object
+    values: unknown[] | undefined,
+    owner: object | undefined
   ): Promise<RawQueryResponse> {
     return this.withLock(
       lockId,
@@ -102,7 +102,7 @@ export class LockRegistry {
     )
   }
 
-  async release(lockId: string, owner?: object): Promise<void> {
+  async release(lockId: string, owner: object | undefined): Promise<void> {
     await this.withLock(
       lockId,
       async (lock) => {
@@ -116,13 +116,7 @@ export class LockRegistry {
     )
   }
 
-  async markTransaction(lockId: string): Promise<void> {
-    await this.withLock(lockId, async (lock) => {
-      lock.inTransaction = true
-    })
-  }
-
-  async commit(lockId: string, owner?: object): Promise<void> {
+  async commit(lockId: string, owner: object | undefined): Promise<void> {
     await this.withLock(
       lockId,
       async (lock) => {
@@ -144,7 +138,7 @@ export class LockRegistry {
     )
   }
 
-  async rollback(lockId: string, owner?: object): Promise<void> {
+  async rollback(lockId: string, owner: object | undefined): Promise<void> {
     await this.withLock(
       lockId,
       async (lock) => {
@@ -204,7 +198,7 @@ export class LockRegistry {
   private async withLock<T>(
     lockId: string,
     fn: (lock: LockRecord) => Promise<T>,
-    owner?: object
+    owner: object | undefined
   ): Promise<T> {
     const lock = this.getLock(lockId, owner)
     const work = lock.busy.then(async () => {
@@ -225,11 +219,12 @@ export class LockRegistry {
     return work
   }
 
-  // A lock created for a messaging channel can only be used through that channel, so one
-  // storage worker cannot reach into another worker's transaction.
-  private getLock(lockId: string, owner?: object): LockRecord {
+  // A lock can only be used through the messaging channel that created it, so one storage
+  // worker cannot reach into another worker's transaction. A request without a channel
+  // can use no lock.
+  private getLock(lockId: string, owner: object | undefined): LockRecord {
     const lock = this.locks.get(lockId)
-    if (!lock || lock.terminal || (owner && lock.owner && lock.owner !== owner)) {
+    if (!lock || lock.terminal || owner === undefined || lock.owner !== owner) {
       throw new DatabaseWattError('PROTOCOL_ERROR', 'Unknown lock ID')
     }
     return lock

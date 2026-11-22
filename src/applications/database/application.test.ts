@@ -1,7 +1,10 @@
+import { getMessaging } from '@platformatic/globals'
 import { setupLoopbackMessaging } from '@platformatic/runtime'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DatabaseErrorResponse } from './errors.js'
 import type { create } from './index.js'
+
+type Handler = (data: unknown, context?: unknown) => Promise<unknown>
 
 type MockClient = {
   queries: Array<{ sql: string; values?: unknown[] }>
@@ -12,6 +15,7 @@ type MockClient = {
 type MockedEnvironment = {
   app: ReturnType<typeof create>
   messaging: ReturnType<typeof setupLoopbackMessaging>
+  handlers: Map<string, Handler>
   clients: MockClient[]
   pools: Array<{
     config: Record<string, unknown>
@@ -142,8 +146,21 @@ async function loadApp(
   const { create } = await import('./index.js')
 
   const messaging = setupLoopbackMessaging('db')
+  const handlers = captureHandlers()
   const app = create()
-  return { app, messaging, clients, pools }
+  return { app, messaging, handlers, clients, pools }
+}
+
+// Records the handlers the application registers, to call one without a messaging channel.
+function captureHandlers(): Map<string, Handler> {
+  const handlers = new Map<string, Handler>()
+  const messaging = getMessaging() as { handle(name: string, handler: Handler): void }
+  const handle = messaging.handle
+  messaging.handle = (name, handler) => {
+    handlers.set(name, handler)
+    handle(name, handler)
+  }
+  return handlers
 }
 
 const originalEnv = { ...process.env }
@@ -218,6 +235,51 @@ describe('database Watt application messaging handlers', () => {
 
     expect(release).toEqual({ released: true })
     expect(clients[0].release).toHaveBeenCalledWith(undefined)
+  })
+
+  it('creates no lock and takes no connection for a request without a channel', async () => {
+    const { clients, handlers } = await loadApp()
+    const destination = createDestination()
+    const statements = [{ sql: 'SELECT 1' }]
+
+    for (const [message, request] of [
+      ['database.acquire', { destination }],
+      ['database.beginTransaction', { destination }],
+      ['database.batch', { destination, statements, commit: false }],
+    ] as const) {
+      await expect(handlers.get(message)?.(request, {})).resolves.toMatchObject({
+        code: 'PROTOCOL_ERROR',
+        message: 'A lock can only be created over a channel',
+      })
+    }
+    expect(clients).toHaveLength(0)
+
+    // A committed batch leaves no lock behind.
+    await expect(
+      handlers.get('database.batch')?.({ destination, statements, commit: true }, {})
+    ).resolves.toEqual(okResponse)
+  })
+
+  it('only serves a lock to the channel that created it', async () => {
+    const { clients, handlers, messaging } = await loadApp()
+
+    const { lockId } = (await messaging.send('database', 'database.beginTransaction', {
+      destination: createDestination(),
+    })) as { lockId: string }
+
+    for (const context of [{}, { channel: { once() {} } }]) {
+      await expect(
+        handlers.get('database.lockedQuery')?.({ lockId, sql: 'SELECT 1' }, context)
+      ).resolves.toMatchObject({ code: 'PROTOCOL_ERROR', message: 'Unknown lock ID' })
+      await expect(
+        handlers.get('database.commitTransaction')?.({ lockId }, context)
+      ).resolves.toMatchObject({ code: 'PROTOCOL_ERROR', message: 'Unknown lock ID' })
+    }
+
+    await expect(
+      messaging.send('database', 'database.commitTransaction', { lockId })
+    ).resolves.toEqual({ committed: true })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual(['BEGIN', 'COMMIT'])
   })
 
   it('runs transaction lifecycle on one pinned connection', async () => {

@@ -142,8 +142,8 @@ export class Application {
       request = rawRequest as AcquireConnectionRequest
 
       this.#assertAcceptingWork()
-      const client = await this.#pools.acquire(request.destination)
       const owner = this.#trackOwner(context)
+      const client = await this.#pools.acquire(request.destination)
       return { lockId: this.#locks.create(request.destination, client, false, owner) }
     } catch (error) {
       return toErrorResponse(error, request ? this.#withDestinationContext(request) : undefined)
@@ -209,8 +209,8 @@ export class Application {
       request = rawRequest as BeginTransactionRequest
 
       this.#assertAcceptingWork()
-      const client = await this.#beginWithRetry(request)
       const owner = this.#trackOwner(context)
+      const client = await this.#beginWithRetry(request)
       return { lockId: this.#locks.create(request.destination, client, true, owner) }
     } catch (error) {
       return toErrorResponse(error, request ? this.#withDestinationContext(request) : undefined)
@@ -256,10 +256,11 @@ export class Application {
   // Locks are owned by the messaging channel of the storage worker that created
   // them. When that worker exits, the channel closes and its open transactions are
   // rolled back right away instead of holding row locks until the idle timeout.
-  #trackOwner(context: MessageContext): object | undefined {
+  // Called before a connection is taken, so a request without a channel gets none.
+  #trackOwner(context: MessageContext): object {
     const channel = context?.channel
     if (!isClosableChannel(channel)) {
-      return undefined
+      throw new DatabaseWattError('PROTOCOL_ERROR', 'A lock can only be created over a channel')
     }
 
     if (!this.#trackedChannels.has(channel)) {
@@ -330,18 +331,19 @@ export class Application {
       request = rawRequest as BatchRequest
 
       this.#assertAcceptingWork()
+      // A transaction left open is owned by the caller's channel.
+      const owner = request.commit ? undefined : this.#trackOwner(context)
       this.#cancellations.start(request.requestId, { cancelled: false })
       cancellationRequestId = request.requestId
 
       const { client, results } = await this.#runBatchWithRetry(request)
       const response = toBatchResponse(request.statements, results)
 
-      if (request.commit) {
+      if (!owner) {
         client.release()
         return response
       }
 
-      const owner = this.#trackOwner(context)
       response.lockId = this.#locks.create(request.destination, client, true, owner)
       return response
     } catch (error) {
