@@ -21,6 +21,9 @@ function installWattMessagingMock(responses: Record<string, unknown> = {}): {
     messaging: {
       handle: vi.fn(),
       notify: vi.fn(),
+      getWorkers: vi.fn(),
+      getWorkerForAffinity: vi.fn(),
+      onWorkersChange: vi.fn(),
       send: vi.fn(async (application: string, message: string, data: Record<string, unknown>) => {
         sent.push({ application, data, message })
         const response = responses[message]
@@ -410,6 +413,9 @@ describe('Watt PostgreSQL connection adapter', () => {
       messaging: {
         handle: vi.fn(),
         notify: vi.fn(),
+        getWorkers: vi.fn(),
+        getWorkerForAffinity: vi.fn(),
+        onWorkersChange: vi.fn(),
         send: vi.fn(async (application: string, message: string, data: Record<string, unknown>) => {
           sent.push({ application, data, message })
           if (message === 'database.cancel') {
