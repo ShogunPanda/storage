@@ -89,18 +89,30 @@ export class Application {
       return
     }
 
-    messaging.handle(DATABASE_MESSAGES.query, this.#handleQuery.bind(this))
-    messaging.handle(DATABASE_MESSAGES.acquire, this.#handleAcquire.bind(this))
-    messaging.handle(DATABASE_MESSAGES.batch, this.#handleBatch.bind(this))
-    messaging.handle(DATABASE_MESSAGES.lockedQuery, this.#handleLockedQuery.bind(this))
-    messaging.handle(DATABASE_MESSAGES.release, this.#handleRelease.bind(this))
-    messaging.handle(DATABASE_MESSAGES.beginTransaction, this.#handleBeginTransaction.bind(this))
-    messaging.handle(DATABASE_MESSAGES.commitTransaction, this.#handleCommitTransaction.bind(this))
+    // The handlers return plain data, with failures as error responses rather than thrown
+    // errors, so their results can be posted without Platformatic walking them first.
+    const plainData = { sanitize: false }
+    messaging.handle(DATABASE_MESSAGES.query, this.#handleQuery.bind(this), plainData)
+    messaging.handle(DATABASE_MESSAGES.acquire, this.#handleAcquire.bind(this), plainData)
+    messaging.handle(DATABASE_MESSAGES.batch, this.#handleBatch.bind(this), plainData)
+    messaging.handle(DATABASE_MESSAGES.lockedQuery, this.#handleLockedQuery.bind(this), plainData)
+    messaging.handle(DATABASE_MESSAGES.release, this.#handleRelease.bind(this), plainData)
+    messaging.handle(
+      DATABASE_MESSAGES.beginTransaction,
+      this.#handleBeginTransaction.bind(this),
+      plainData
+    )
+    messaging.handle(
+      DATABASE_MESSAGES.commitTransaction,
+      this.#handleCommitTransaction.bind(this),
+      plainData
+    )
     messaging.handle(
       DATABASE_MESSAGES.rollbackTransaction,
-      this.#handleRollbackTransaction.bind(this)
+      this.#handleRollbackTransaction.bind(this),
+      plainData
     )
-    messaging.handle(DATABASE_MESSAGES.cancel, this.#handleCancel.bind(this))
+    messaging.handle(DATABASE_MESSAGES.cancel, this.#handleCancel.bind(this), plainData)
     messaging.handle('database.test.stats', () => ({ ...this.#stats }))
     messaging.handle('database.test.resetStats', this.#handleResetStats.bind(this))
   }

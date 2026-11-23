@@ -3,8 +3,10 @@ import { setupLoopbackMessaging } from '@platformatic/runtime'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DatabaseErrorResponse } from './errors.js'
 import type { create } from './index.js'
+import { DATABASE_MESSAGES } from './protocol.js'
 
 type Handler = (data: unknown, context?: unknown) => Promise<unknown>
+type HandlerOptions = { sanitize?: boolean } | undefined
 
 type MockClient = {
   queries: Array<{ sql: string; values?: unknown[] }>
@@ -16,6 +18,7 @@ type MockedEnvironment = {
   app: ReturnType<typeof create>
   messaging: ReturnType<typeof setupLoopbackMessaging>
   handlers: Map<string, Handler>
+  handlerOptions: Map<string, HandlerOptions>
   clients: MockClient[]
   pools: Array<{
     config: Record<string, unknown>
@@ -146,21 +149,26 @@ async function loadApp(
   const { create } = await import('./index.js')
 
   const messaging = setupLoopbackMessaging('db')
-  const handlers = captureHandlers()
+  const { handlers, handlerOptions } = captureHandlers()
   const app = create()
-  return { app, messaging, handlers, clients, pools }
+  return { app, messaging, handlers, handlerOptions, clients, pools }
 }
 
-// Records the handlers the application registers, to call one without a messaging channel.
-function captureHandlers(): Map<string, Handler> {
+// Records the handlers the application registers and their options, to call one without a
+// messaging channel.
+function captureHandlers() {
   const handlers = new Map<string, Handler>()
-  const messaging = getMessaging() as { handle(name: string, handler: Handler): void }
-  const handle = messaging.handle
-  messaging.handle = (name, handler) => {
-    handlers.set(name, handler)
-    handle(name, handler)
+  const handlerOptions = new Map<string, HandlerOptions>()
+  const messaging = getMessaging() as {
+    handle(name: string, handler: Handler, options?: HandlerOptions): void
   }
-  return handlers
+  const handle = messaging.handle
+  messaging.handle = (name, handler, options) => {
+    handlers.set(name, handler)
+    handlerOptions.set(name, options)
+    handle(name, handler, options)
+  }
+  return { handlers, handlerOptions }
 }
 
 const originalEnv = { ...process.env }
@@ -177,6 +185,14 @@ describe('database Watt application messaging handlers', () => {
     const { app } = await loadApp()
 
     expect(app.isBackgroundApplication).toBe(true)
+  })
+
+  it('posts the results of the database handlers without sanitizing them', async () => {
+    const { handlerOptions } = await loadApp()
+
+    for (const message of Object.values(DATABASE_MESSAGES)) {
+      expect(handlerOptions.get(message), message).toEqual({ sanitize: false })
+    }
   })
 
   it('executes stateless queries against the single-tenant destination', async () => {

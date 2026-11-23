@@ -22,6 +22,10 @@ import {
 import { assertValidSignal } from '../postgres/asserts'
 import { createAbortError } from '../postgres/pool-errors'
 
+// Requests are plain data, so Platformatic posts them without walking them first. A value
+// that can't be cloned still goes through: Platformatic then sanitizes the request and retries.
+const PLAIN_DATA = { sanitize: false }
+
 export interface DatabaseWattRequestOptions {
   signal?: AbortSignal
 }
@@ -141,7 +145,7 @@ export class DatabaseWattClient implements DatabaseWattTransport {
     }
     const payload = data
     const request = getMessaging()
-      .send(DATABASE_APPLICATION_ID, message, payload)
+      .send(DATABASE_APPLICATION_ID, message, payload, PLAIN_DATA)
       .catch((error: unknown) => {
         throw toTransportError(error, requestId, lockId)
       })
@@ -208,7 +212,7 @@ export const databaseWattClient: DatabaseWattTransport = new DatabaseWattClient(
 
 function sendCancel(requestId: string, lockId: string | undefined): void {
   void getMessaging()
-    .send(DATABASE_APPLICATION_ID, DATABASE_MESSAGES.cancel, { requestId, lockId })
+    .send(DATABASE_APPLICATION_ID, DATABASE_MESSAGES.cancel, { requestId, lockId }, PLAIN_DATA)
     .catch(() => undefined)
 }
 

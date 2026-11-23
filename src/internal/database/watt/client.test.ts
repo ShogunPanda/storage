@@ -6,6 +6,7 @@ type SentWattMessage = {
   application: string
   data: Record<string, unknown>
   message: string
+  options?: Record<string, unknown>
 }
 
 afterEach(() => {
@@ -37,6 +38,7 @@ describe('Database Watt client transport', () => {
         sql: 'SELECT $1::int AS id',
         values: [1],
       },
+      options: { sanitize: false },
     })
   })
 
@@ -121,6 +123,7 @@ describe('Database Watt client transport', () => {
       lockId: 'lock-a',
       requestId: sent[0].data.requestId,
     })
+    expect(sent[1].options).toEqual({ sanitize: false })
   })
 
   it('rolls back a transaction that a batch opened after its caller gave up', async () => {
@@ -194,11 +197,18 @@ function installWattMessagingMock(responses: Record<string, unknown>): {
       getWorkers: vi.fn(),
       getWorkerForAffinity: vi.fn(),
       onWorkersChange: vi.fn(),
-      send: vi.fn(async (application: string, message: string, data: Record<string, unknown>) => {
-        sent.push({ application, data, message })
-        const response = responses[message]
-        return response instanceof Promise ? response : response
-      }),
+      send: vi.fn(
+        async (
+          application: string,
+          message: string,
+          data: Record<string, unknown>,
+          options?: Record<string, unknown>
+        ) => {
+          sent.push({ application, data, message, options })
+          const response = responses[message]
+          return response instanceof Promise ? response : response
+        }
+      ),
     },
   })
 
