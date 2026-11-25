@@ -783,9 +783,11 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       getOptionalConfigFromEnv('DATABASE_WATT_LOCK_MAX_LIFETIME'),
       120_000
     ),
+    // The same default as TENANT_POOL_CACHE_MAX_ENTRIES: the database application holds the
+    // pools of every tenant the storage workers would cache.
     databaseWattMaxActivePools: envNonNegativeInteger(
       getOptionalConfigFromEnv('DATABASE_WATT_MAX_ACTIVE_POOLS'),
-      1_000
+      16_384
     ),
     databaseWattPoolIdleTimeout: envNonNegativeInteger(
       getOptionalConfigFromEnv('DATABASE_WATT_POOL_IDLE_TIMEOUT') ||

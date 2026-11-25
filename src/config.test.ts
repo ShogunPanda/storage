@@ -721,7 +721,7 @@ describe('configuration parsing', () => {
       databaseWattGlobalMaxConnections: 20,
       databaseWattLockIdleTimeout: 30_000,
       databaseWattLockMaxLifetime: 120_000,
-      databaseWattMaxActivePools: 1_000,
+      databaseWattMaxActivePools: 16_384,
       databaseWattPoolIdleTimeout: 60_000,
       databaseWattShutdownTimeout: 10_000,
     })

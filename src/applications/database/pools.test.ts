@@ -8,13 +8,20 @@ const pgMock = vi.hoisted(() => {
 
   const state = {
     pending: [] as PendingConnect[],
-    pools: [] as Array<{ options: Record<string, unknown> }>,
+    pools: [] as Array<{
+      options: Record<string, unknown>
+      totalCount: number
+      idleCount: number
+      waitingCount: number
+      ended: boolean
+    }>,
   }
 
   class Pool {
     totalCount = 0
     idleCount = 0
     waitingCount = 0
+    ended = false
     options: Record<string, unknown>
 
     constructor(options: Record<string, unknown>) {
@@ -32,7 +39,9 @@ const pgMock = vi.hoisted(() => {
       })
     }
 
-    async end() {}
+    async end() {
+      this.ended = true
+    }
   }
 
   return { Pool, state, types: { setTypeParser: () => undefined } }
@@ -95,6 +104,66 @@ describe('database pool registry', () => {
       .catch(() => undefined)
 
     expect(pgMock.state.pools[0].options.connectionTimeoutMillis).toBe(25_000)
+    await registry.close()
+  })
+
+  function target(id: string) {
+    return {
+      connectionString: `postgres://${id}-db`,
+      id,
+      isExternalPool: false,
+      maxConnections: 1,
+    }
+  }
+
+  function acquire(registry: PoolRegistry, id: string) {
+    const acquiring = registry.acquire(target(id))
+    acquiring.catch(() => undefined)
+    return acquiring
+  }
+
+  it('evicts the least recently used idle pool when the registry is full', async () => {
+    const registry = new PoolRegistry({ ...getConfig(), databaseWattMaxActivePools: 2 })
+    void acquire(registry, 'tenant-a')
+    void acquire(registry, 'tenant-b')
+    // tenant-a is used again, so tenant-b is now the least recently used.
+    void acquire(registry, 'tenant-a')
+
+    void acquire(registry, 'tenant-c')
+
+    expect(pgMock.state.pools.map((pool) => pool.ended)).toEqual([false, true, false])
+    await registry.close()
+  })
+
+  it('skips pools that are in use when it evicts', async () => {
+    const registry = new PoolRegistry({ ...getConfig(), databaseWattMaxActivePools: 3 })
+    void acquire(registry, 'tenant-a')
+    void acquire(registry, 'tenant-b')
+    void acquire(registry, 'tenant-c')
+    const [inUse, waitedOn] = pgMock.state.pools
+    inUse.totalCount = 1
+    waitedOn.waitingCount = 1
+
+    void acquire(registry, 'tenant-d')
+
+    expect(pgMock.state.pools.map((pool) => pool.ended)).toEqual([false, false, true, false])
+    await registry.close()
+  })
+
+  it.each([
+    ['a client is checked out', { totalCount: 1 }],
+    ['a request is waiting', { waitingCount: 1 }],
+  ])('rejects another destination when the registry is full and %s', async (_, busy) => {
+    const registry = new PoolRegistry({ ...getConfig(), databaseWattMaxActivePools: 1 })
+    void acquire(registry, 'tenant-a')
+    Object.assign(pgMock.state.pools[0], busy)
+
+    await expect(acquire(registry, 'tenant-b')).rejects.toMatchObject({
+      code: 'BUSY',
+      message: 'Maximum active destination pools reached',
+    })
+    expect(pgMock.state.pools).toHaveLength(1)
+    expect(pgMock.state.pools[0].ended).toBe(false)
     await registry.close()
   })
 })

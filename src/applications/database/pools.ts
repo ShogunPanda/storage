@@ -176,10 +176,17 @@ export class PoolRegistry {
         this.resizePool(existing, destination)
       }
       existing.lastUsedAt = Date.now()
+      // Keeps the map in least recently used order, so a full registry evicts from the front.
+      this.pools.delete(destination.id)
+      this.pools.set(destination.id, existing)
       return existing
     }
 
-    if (!existing && this.pools.size >= this.config.databaseWattMaxActivePools) {
+    if (
+      !existing &&
+      this.pools.size >= this.config.databaseWattMaxActivePools &&
+      !this.evictLeastRecentlyUsedIdlePool()
+    ) {
       throw new DatabaseWattError('BUSY', 'Maximum active destination pools reached')
     }
 
@@ -225,6 +232,7 @@ export class PoolRegistry {
     }
 
     if (existing) {
+      this.pools.delete(destination.id)
       this.retirePool(existing.pool)
     }
 
@@ -318,6 +326,20 @@ export class PoolRegistry {
     }
 
     return reclaimed
+  }
+
+  // Makes room for another destination by ending the least recently used pool that has no
+  // client checked out and no request waiting. Returns whether a pool was evicted.
+  private evictLeastRecentlyUsedIdlePool(): boolean {
+    for (const [destination, entry] of this.pools) {
+      if (entry.pool.totalCount === entry.pool.idleCount && entry.pool.waitingCount === 0) {
+        this.pools.delete(destination)
+        this.retirePool(entry.pool)
+        return true
+      }
+    }
+
+    return false
   }
 
   private async evictIdlePools(): Promise<void> {
