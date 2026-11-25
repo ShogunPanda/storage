@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { removeGlobals } from '@platformatic/globals'
 import { setupLoopbackMessaging } from '@platformatic/runtime'
 import { types } from 'pg'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { getConfig } from '../../config.js'
 import { DBMigration } from '../../internal/database/migrations/types.js'
 import {
@@ -24,6 +24,7 @@ type DatabaseWattStats = {
   beginTransaction: number
   cancel: number
   commitTransaction: number
+  lockedBatch: number
   lockedQuery: number
   query: number
   release: number
@@ -123,6 +124,7 @@ function loopbackTransport(): DatabaseWattTransport {
     query: sender('database.query'),
     acquire: sender('database.acquire'),
     batch: sender('database.batch'),
+    lockedBatch: sender('database.lockedBatch'),
     lockedQuery: sender('database.lockedQuery'),
     release: sender('database.release'),
     beginTransaction: sender('database.beginTransaction'),
@@ -607,6 +609,154 @@ describe('Database Watt application loopback integration', () => {
         })
       )
     }
+  })
+
+  describe('the database work of an upload', () => {
+    const destination = testDestination()
+    let bucketName: string
+
+    function storageFor(role: 'service_role' | 'authenticated') {
+      const connection = getWattPostgresConnection(
+        {
+          dbUrl: destination.connectionString,
+          isExternalPool: destination.isExternalPool,
+          maxConnections: destination.maxConnections,
+          tenantId: destination.id,
+          operation: () => 'storage.object.upload',
+          superUser: { jwt: '', payload: { role: 'service_role' } },
+          user: { jwt: '', payload: { role, sub: randomUUID() } },
+        },
+        loopbackTransport()
+      )
+      return connection.then(
+        (tenantConnection) =>
+          new StoragePgDB(tenantConnection, {
+            tenantId: destination.id,
+            host: 'localhost',
+            latestMigration: latestDBMigration(),
+          })
+      )
+    }
+
+    function probeRow(name: string) {
+      return { bucket_id: bucketName, name, owner: undefined, metadata: {}, version: randomUUID() }
+    }
+
+    async function objectCount(name: string): Promise<number> {
+      const result = await checkedResult<RawRowsResponse>(
+        sendDatabaseMessage('database.query', {
+          destination,
+          requestId: randomUUID(),
+          sql: 'SELECT count(*)::int AS n FROM storage.objects WHERE bucket_id = $1 AND name = $2',
+          values: [bucketName, name],
+        })
+      )
+      return decodeRows<{ n: number }>(result)[0].n
+    }
+
+    beforeEach(async () => {
+      bucketName = uniqueBucketName('dbwatt-upload')
+      await checkedResult(insertBucket(bucketName))
+      await resetDatabaseWattStats()
+    })
+
+    afterEach(async () => {
+      await checkedResult(
+        sendDatabaseMessage('database.batch', {
+          destination,
+          statements: [
+            { sql: `SELECT set_config('storage.allow_delete_query', 'true', true)` },
+            { sql: 'DELETE FROM storage.objects WHERE bucket_id = $1', values: [bucketName] },
+            { sql: 'DELETE FROM storage.buckets WHERE id = $1', values: [bucketName] },
+          ],
+          commit: true,
+        })
+      )
+    })
+
+    it('probes a single statement with one message that rolls back', async () => {
+      const db = await storageFor('service_role')
+
+      const probed = await db.testPermission((probe) => probe.createObject(probeRow('a.txt')), {
+        singleStatement: true,
+      })
+      const stats = await getDatabaseWattStats()
+
+      expect(probed).toMatchObject({ name: 'a.txt' })
+      expect(stats).toMatchObject({ batch: 1, lockedQuery: 0, rollbackTransaction: 0 })
+      expect(await objectCount('a.txt')).toBe(0)
+    })
+
+    it('answers a denied single-statement probe with the policy error', async () => {
+      const db = await storageFor('authenticated')
+
+      await expect(
+        db.testPermission((probe) => probe.createObject(probeRow('denied.txt')), {
+          singleStatement: true,
+        })
+      ).rejects.toMatchObject({ code: 'AccessDenied' })
+      expect(await getDatabaseWattStats()).toMatchObject({ batch: 1, rollbackTransaction: 0 })
+    })
+
+    it('locks, reads, probes and writes in four messages', async () => {
+      const db = await storageFor('service_role')
+
+      const written = await db.asSuperUser().withTransaction(async (tx) => {
+        const { versioningStatus, object } = await tx.lockObjectForWrite(bucketName, 'b.txt', {
+          lockTimeout: 5000,
+          objectColumns: 'id, version, metadata, is_delete_marker, is_versioned',
+          versioning: true,
+        })
+        expect(object).toBeUndefined()
+
+        // The caller's probe inside the write: a savepoint that is rolled back.
+        await tx
+          .asCaller()
+          .testPermission((probe) =>
+            probe.upsertObject(probeRow('b.txt'), { currentVersion: true })
+          )
+
+        return tx.upsertObject(
+          { ...probeRow('b.txt'), user_metadata: undefined },
+          { versioningStatus }
+        )
+      })
+      const stats = await getDatabaseWattStats()
+
+      expect(written).toMatchObject({ name: 'b.txt' })
+      expect(await objectCount('b.txt')).toBe(1)
+      // BEGIN, scope, lock and reads; SAVEPOINT and probe; ROLLBACK TO, RELEASE and the write;
+      // COMMIT.
+      expect(stats).toMatchObject({
+        batch: 1,
+        lockedBatch: 2,
+        lockedQuery: 0,
+        commitTransaction: 1,
+      })
+    })
+
+    it('rolls back to the savepoint of a denied probe before the next statement', async () => {
+      const db = await storageFor('authenticated')
+
+      const outcome = await db.asSuperUser().withTransaction(async (tx) => {
+        await tx.lockObjectForWrite(bucketName, 'c.txt', {
+          lockTimeout: 5000,
+          objectColumns: 'id',
+          versioning: false,
+        })
+        const denied = await tx
+          .asCaller()
+          .testPermission((probe) => probe.createObject(probeRow('c.txt')))
+          .catch((error: { code?: string }) => error.code)
+
+        // Runs after the deferred ROLLBACK TO SAVEPOINT, in the same message.
+        await tx.createObject(probeRow('c.txt'))
+        return denied
+      })
+
+      expect(outcome).toBe('AccessDenied')
+      expect(await objectCount('c.txt')).toBe(1)
+    })
   })
 
   it('opens a transaction from a batch message and continues it by lock', async () => {

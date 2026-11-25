@@ -10,6 +10,7 @@ import { getConfig } from '../../../config'
 import {
   DatabaseExecutor,
   DatabaseQueryArgument,
+  DatabaseQueryOptions,
   DatabaseStatement,
   DatabaseTransaction,
   DatabaseTransactionalExecutor,
@@ -27,6 +28,7 @@ import {
 } from '../postgres/sql'
 import { installPostgresTypeParsers } from '../postgres/type-parsers'
 import {
+  DatabaseWattBatchResponse,
   DatabaseWattQueryResponse,
   DatabaseWattResponseError,
   DatabaseWattTransport,
@@ -59,7 +61,9 @@ interface WattTransactionStart {
  *
  * It starts lazily: BEGIN, the deferred settings, the scope statement and the first query
  * travel in one `database.batch` message instead of one message each. A transaction that
- * never runs a query sends nothing at all.
+ * never runs a query sends nothing at all. Later statements whose result nobody reads
+ * (scope statements, savepoint commands) are deferred too, and travel with the next query
+ * or with COMMIT.
  */
 class WattPgTransaction implements DatabaseTransaction {
   private wattCompleted = false
@@ -101,45 +105,31 @@ class WattPgTransaction implements DatabaseTransaction {
     return pending
   }
 
-  // Queues a statement whose result nobody reads (the scope statement) to run right
-  // after BEGIN, in the same message as the first query.
-  defer(statement: BatchStatement): void {
-    this.deferredStatements.push(statement)
+  // Queues a statement whose result nobody reads to run before the next query, or before
+  // COMMIT, in the same message. ROLLBACK drops it. An error it raises is the next query's.
+  defer(statement: DatabaseStatement): void {
+    this.deferredStatements.push({ sql: statement.text, values: statement.values })
   }
 
   async query<T extends QueryResultRow = QueryResultRow>(
     statement: string | DatabaseStatement,
     options?: DatabaseQueryArgument
   ): Promise<QueryResult<T>> {
-    if (this.wattCompleted) {
-      throw new Error('Cannot query a completed transaction')
-    }
-
-    const signal = Array.isArray(options) ? undefined : options?.signal
     const query = normalizeStatement(statement, Array.isArray(options) ? options : undefined)
+    const signal = Array.isArray(options) ? undefined : options?.signal
+    const results = await this.run([query], signal)
+    return results[0] as QueryResult<T>
+  }
 
-    if (this.lockId === undefined) {
-      if (!this.starting) {
-        const result = this.startWith<T>(query, signal)
-        this.starting = result.then(
-          () => undefined,
-          () => undefined
-        )
-        return result
-      }
-
-      // A concurrent query waits for the one that is opening the transaction.
-      await this.starting
-      if (this.wattCompleted || this.lockId === undefined) {
-        throw new Error('Cannot query a completed transaction')
-      }
-    }
-
-    if (this.pendingStatementTimeoutMs !== undefined || this.pendingSearchPath !== undefined) {
-      await this.applyPendingSettings(signal)
-    }
-
-    return this.lockedQuery<T>(query.text, query.values, signal)
+  /**
+   * Runs `statements` in order with one message and returns every result. The first
+   * failure is thrown.
+   */
+  queryBatch(
+    statements: DatabaseStatement[],
+    options?: DatabaseQueryOptions
+  ): Promise<QueryResult[]> {
+    return this.run(statements, options?.signal)
   }
 
   async commit(): Promise<void> {
@@ -150,12 +140,18 @@ class WattPgTransaction implements DatabaseTransaction {
 
     // Nothing ran, so there is no transaction to commit.
     if (this.lockId === undefined) {
+      this.deferredStatements.length = 0
       this.wattCompleted = true
       return
     }
 
+    const statements = this.takeDeferredStatements()
     try {
-      await withPgErrors(this.transport.commitTransaction({ lockId: this.lockId }))
+      await withPgErrors(
+        this.transport.commitTransaction(
+          statements.length > 0 ? { lockId: this.lockId, statements } : { lockId: this.lockId }
+        )
+      )
     } finally {
       this.wattCompleted = true
     }
@@ -163,6 +159,8 @@ class WattPgTransaction implements DatabaseTransaction {
 
   async rollback(): Promise<void> {
     await this.starting
+    // Whatever was deferred is undone by the rollback anyway.
+    this.deferredStatements.length = 0
     if (this.wattCompleted) {
       return
     }
@@ -179,18 +177,43 @@ class WattPgTransaction implements DatabaseTransaction {
     }
   }
 
-  private async startWith<T extends QueryResultRow>(
-    query: DatabaseStatement,
+  private async run(
+    queries: DatabaseStatement[],
     signal: AbortSignal | undefined
-  ): Promise<QueryResult<T>> {
-    const statements: BatchStatement[] = []
-    const settings = takePendingSettingsStatement(this)
-    if (settings) {
-      statements.push(settings)
+  ): Promise<QueryResult[]> {
+    if (this.wattCompleted) {
+      throw new Error('Cannot query a completed transaction')
     }
-    statements.push(...this.deferredStatements, { sql: query.text, values: query.values })
-    this.deferredStatements.length = 0
 
+    if (this.lockId === undefined) {
+      if (!this.starting) {
+        const result = this.startWith(queries, signal)
+        this.starting = result.then(
+          () => undefined,
+          () => undefined
+        )
+        return result
+      }
+
+      // A concurrent query waits for the one that is opening the transaction.
+      await this.starting
+      if (this.wattCompleted || this.lockId === undefined) {
+        throw new Error('Cannot query a completed transaction')
+      }
+    }
+
+    const statements = this.takeQueuedStatements()
+    if (statements.length === 0 && queries.length === 1) {
+      return [await this.lockedQuery(queries[0].text, queries[0].values, signal)]
+    }
+
+    return this.lockedBatch(withResults(statements, queries), signal)
+  }
+
+  private async startWith(
+    queries: DatabaseStatement[],
+    signal: AbortSignal | undefined
+  ): Promise<QueryResult[]> {
     try {
       const response = await withPgErrors(
         this.transport.batch(
@@ -200,7 +223,7 @@ class WattPgTransaction implements DatabaseTransaction {
             readOnly: this.start.readOnly,
             holdOpen: this.start.holdOpen,
             operationName: this.operation?.(),
-            statements,
+            statements: withResults(this.takeQueuedStatements(), queries),
             commit: false,
           },
           { signal }
@@ -211,7 +234,7 @@ class WattPgTransaction implements DatabaseTransaction {
         this.wattCompleted = true
         throw new Error('Database Watt batch response is missing the lock ID')
       }
-      return toPgQueryResult<T>(response)
+      return toBatchResults(response)
     } catch (error) {
       // A failed batch leaves no transaction behind; an aborted request may have, but
       // its lock is unknown here and expires on the Database application side.
@@ -220,11 +243,19 @@ class WattPgTransaction implements DatabaseTransaction {
     }
   }
 
-  private async applyPendingSettings(signal?: AbortSignal): Promise<void> {
-    const statement = takePendingSettingsStatement(this)
-    if (statement) {
-      await this.lockedQuery(statement.sql, statement.values, signal)
+  // The settings still pending, then the deferred statements, in the order they came.
+  private takeQueuedStatements(): BatchStatement[] {
+    const statements: BatchStatement[] = []
+    const settings = takePendingSettingsStatement(this)
+    if (settings) {
+      statements.push(settings)
     }
+    statements.push(...this.takeDeferredStatements())
+    return statements
+  }
+
+  private takeDeferredStatements(): BatchStatement[] {
+    return this.deferredStatements.splice(0, this.deferredStatements.length)
   }
 
   private async lockedQuery<T extends QueryResultRow = QueryResultRow>(
@@ -254,6 +285,52 @@ class WattPgTransaction implements DatabaseTransaction {
       throw error
     }
   }
+
+  private async lockedBatch(
+    statements: BatchStatement[],
+    signal: AbortSignal | undefined
+  ): Promise<QueryResult[]> {
+    try {
+      const response = await withPgErrors(
+        this.transport.lockedBatch(
+          {
+            lockId: this.lockId as string,
+            operationName: this.operation?.(),
+            statements,
+          },
+          { signal }
+        )
+      )
+      return toBatchResults(response)
+    } catch (error) {
+      if (isConnectionDiscarded(error)) {
+        this.wattCompleted = true
+      }
+      throw error
+    }
+  }
+}
+
+// `statements` (whose results nobody reads), then `queries`, each but the last flagged so
+// its result comes back too: the last one's result is the response itself.
+function withResults(statements: BatchStatement[], queries: DatabaseStatement[]): BatchStatement[] {
+  const last = queries.length - 1
+  for (let i = 0; i <= last; i++) {
+    const query = queries[i]
+    statements.push(
+      i < last
+        ? { sql: query.text, values: query.values, result: true }
+        : { sql: query.text, values: query.values }
+    )
+  }
+  return statements
+}
+
+// The results of the flagged statements, then the last statement's.
+function toBatchResults(response: DatabaseWattBatchResponse): QueryResult[] {
+  const results = (response.results ?? []).map((result) => toPgQueryResult(result))
+  results.push(toPgQueryResult(response))
+  return results
 }
 
 function takePendingSettingsStatement(tnx: WattPgTransaction): BatchStatement | undefined {
@@ -275,8 +352,9 @@ function takePendingSettingsStatement(tnx: WattPgTransaction): BatchStatement | 
 }
 
 /**
- * Runs exactly one statement as a whole transaction (BEGIN, scope, statement, COMMIT)
- * with a single message. Used by StoragePgDB for operations that issue one query.
+ * Runs exactly one statement as a whole transaction (BEGIN, scope, statement, then COMMIT
+ * or, for a permission probe, ROLLBACK) with a single message. Used by StoragePgDB for
+ * operations that issue one query.
  */
 class WattPgSingleStatementExecutor implements DatabaseExecutor {
   private used = false
@@ -285,7 +363,8 @@ class WattPgSingleStatementExecutor implements DatabaseExecutor {
     private readonly start: WattTransactionStart,
     private readonly setup: BatchStatement[],
     private readonly operation: (() => string | undefined) | undefined,
-    private readonly transport: DatabaseWattTransport
+    private readonly transport: DatabaseWattTransport,
+    private readonly end: 'commit' | 'rollback'
   ) {}
 
   async query<T extends QueryResultRow = QueryResultRow>(
@@ -307,7 +386,8 @@ class WattPgSingleStatementExecutor implements DatabaseExecutor {
           readOnly: this.start.readOnly,
           operationName: this.operation?.(),
           statements: [...this.setup, { sql: query.text, values: query.values }],
-          commit: true,
+          commit: this.end === 'commit',
+          ...(this.end === 'rollback' ? { rollback: true } : {}),
         },
         { signal }
       )
@@ -366,13 +446,15 @@ export class WattPgExecutor implements DatabaseTransactionalExecutor {
 
   singleStatement(
     options: TransactionOptions | undefined,
-    setup: BatchStatement[]
+    setup: BatchStatement[],
+    end: 'commit' | 'rollback' = 'commit'
   ): WattPgSingleStatementExecutor {
     return new WattPgSingleStatementExecutor(
       this.getTransactionStart(options),
       setup,
       this.operation,
-      this.transport
+      this.transport,
+      end
     )
   }
 
@@ -396,9 +478,7 @@ export class WattPgExecutor implements DatabaseTransactionalExecutor {
       )
     )
 
-    const results = (response.results ?? []).map((result) => toPgQueryResult(result))
-    results.push(toPgQueryResult(response))
-    return results
+    return toBatchResults(response)
   }
 
   private getTransactionStart(options: TransactionOptions | undefined): WattTransactionStart {
@@ -502,9 +582,9 @@ export class WattPgTenantConnection implements TenantConnection {
 
     const scope = this.buildScope(statementTimeoutMs, pendingSearchPath)
 
-    // Before the transaction has started, the scope rides along with its first query.
-    if (tnx instanceof WattPgTransaction && !tnx.isStarted()) {
-      tnx.defer({ sql: scope.text, values: scope.values })
+    // Nobody reads the scope statement's result: it rides along with the next query.
+    if (tnx instanceof WattPgTransaction) {
+      tnx.defer(scope)
       return
     }
 
@@ -516,6 +596,21 @@ export class WattPgTenantConnection implements TenantConnection {
    * settings and scope as transaction() plus setScope(), then COMMIT) in one message.
    */
   singleStatementExecutor(options?: TransactionOptions): DatabaseExecutor {
+    return this.createSingleStatementExecutor(options, 'commit')
+  }
+
+  /**
+   * Like singleStatementExecutor(), but the transaction is rolled back: for permission
+   * probes, whose answer is whether the statement succeeds.
+   */
+  rollbackStatementExecutor(options?: TransactionOptions): DatabaseExecutor {
+    return this.createSingleStatementExecutor(options, 'rollback')
+  }
+
+  private createSingleStatementExecutor(
+    options: TransactionOptions | undefined,
+    end: 'commit' | 'rollback'
+  ): DatabaseExecutor {
     this.assertNotAborted()
     const scope = this.buildScope(
       options?.timeout !== undefined
@@ -524,7 +619,7 @@ export class WattPgTenantConnection implements TenantConnection {
       this.options.isExternalPool ? externalPoolSearchPath : undefined
     )
 
-    return this.executor.singleStatement(options, [{ sql: scope.text, values: scope.values }])
+    return this.executor.singleStatement(options, [{ sql: scope.text, values: scope.values }], end)
   }
 
   /**

@@ -26,7 +26,7 @@ import {
   type LifecycleDeletedObjectRow,
   lifecycleDeletionCounters,
 } from '@storage/lifecycle/counters'
-import { DatabaseError, QueryResultRow } from 'pg'
+import { DatabaseError, type QueryResult, QueryResultRow } from 'pg'
 import { DatabaseEngine, getConfig } from '../../config'
 import { isUuid } from '../limits'
 import {
@@ -60,6 +60,9 @@ import {
   FindBucketFilters,
   FindObjectFilters,
   ListBucketOptions,
+  lockObjectForWriteInTurn,
+  ObjectForWrite,
+  ObjectForWriteOptions,
   ObjectLockKey,
   ObjectTargets,
   ScannerS3Key,
@@ -310,7 +313,7 @@ export class StoragePgDB implements Database {
           await this.applyScope(tnx, scope, scopeToRestore)
         }
 
-        await tnx.query(`RELEASE SAVEPOINT ${savepoint}`)
+        await releaseSavepoint(tnx, savepoint)
       } else {
         await tnx.commit()
       }
@@ -450,7 +453,30 @@ export class StoragePgDB implements Database {
     })
   }
 
-  async testPermission<T>(fn: (db: StoragePgDB) => T | Promise<T>): Promise<Awaited<T>> {
+  async testPermission<T>(
+    fn: (db: StoragePgDB) => T | Promise<T>,
+    options?: { singleStatement?: boolean }
+  ): Promise<Awaited<T>> {
+    // A probe of one statement can run as one transaction that rolls itself back: BEGIN,
+    // scope, the statement and ROLLBACK in a single message (Database Watt).
+    const probe =
+      options?.singleStatement && !this.options.tnx
+        ? this.connection.rollbackStatementExecutor?.()
+        : undefined
+    if (probe) {
+      try {
+        return await fn(
+          new StoragePgDB(this.connection, {
+            ...this.options,
+            tnx: new SingleStatementTransaction(probe),
+            scope: { applied: this.connection },
+          })
+        )
+      } catch (e) {
+        throw mapPgError(e)
+      }
+    }
+
     let result: Awaited<T>
     try {
       await this.withTransaction(async (db) => {
@@ -2423,44 +2449,8 @@ export class StoragePgDB implements Database {
           return true
         }
 
-        // Single round-trip: read current -> set new -> acquire -> restore.
-        // MATERIALIZED forces each CTE to materialize before the next scans,
-        // which sequences the side-effecting set_config and pg_advisory_xact_lock
-        // calls in dependency order. Without MATERIALIZED the optimizer could
-        // inline and reorder volatile-function evaluation.
-        const query = `
-          WITH previous_lock_timeout AS MATERIALIZED (
-            SELECT current_setting('lock_timeout') AS value
-          ),
-          set_lock_timeout AS MATERIALIZED (
-            SELECT
-              set_config('lock_timeout', $2, true) AS applied_timeout,
-              value
-            FROM previous_lock_timeout
-          ),
-          acquire_lock AS MATERIALIZED (
-            SELECT
-              pg_advisory_xact_lock($1),
-              applied_timeout,
-              value
-            FROM set_lock_timeout
-          ),
-          restore_lock_timeout AS MATERIALIZED (
-            SELECT set_config('lock_timeout', value, true) AS restored_timeout
-            FROM acquire_lock
-          )
-          SELECT true AS locked
-          FROM restore_lock_timeout
-        `
-
         try {
-          await db.query(
-            {
-              text: query,
-              values: [hash, `${lockTimeout}ms`],
-            },
-            { signal }
-          )
+          await db.query(objectLockStatement(hash, lockTimeout), { signal })
         } catch (e) {
           if (isPgLockTimeoutError(e)) {
             throw ERRORS.LockTimeout(e)
@@ -2490,6 +2480,66 @@ export class StoragePgDB implements Database {
 
       return true
     })
+  }
+
+  async lockObjectForWrite(
+    bucketId: string,
+    objectName: string,
+    options: ObjectForWriteOptions
+  ): Promise<ObjectForWrite> {
+    const tnx = this.options.tnx
+    if (
+      !tnx?.queryBatch ||
+      !(options.lockTimeout > 0) ||
+      this.isMultigresDatabase() ||
+      this.scopeSwitchNeeded(this.options.scope)
+    ) {
+      return lockObjectForWriteInTurn(this, bucketId, objectName, options)
+    }
+
+    const [bucketStatement, objectStatement] = await Promise.all([
+      options.versioning
+        ? this.findBucketByIdStatement(bucketId, 'versioning_status', { forShare: true })
+        : undefined,
+      this.findObjectStatement(bucketId, objectName, options.objectColumns, {
+        forUpdate: true,
+        dontErrorOnEmpty: true,
+      }),
+    ])
+    const statements = [
+      objectLockStatement(objectLockHash(bucketId, objectName), options.lockTimeout),
+    ]
+    if (bucketStatement) {
+      statements.push(bucketStatement)
+    }
+    statements.push(objectStatement)
+
+    const queryName = 'LockObjectForWrite'
+    const abortSignal = this.connection.getAbortSignal()
+    const recordDuration = this.createDurationRecorder(queryName, performance.now(), abortSignal)
+    let results: QueryResult[]
+    try {
+      results = await tnx.queryBatch(statements, { signal: abortSignal })
+    } catch (e) {
+      // The lock comes first: a lock timeout can only be its failure.
+      if (isPgLockTimeoutError(e)) {
+        throw ERRORS.LockTimeout(e)
+      }
+      throw mapPgErrorWithQueryName(e, queryName)
+    } finally {
+      recordDuration()
+    }
+
+    let versioningStatus: ObjectForWrite['versioningStatus'] = 'DISABLED'
+    if (bucketStatement) {
+      const bucket = results[1].rows[0] as Bucket | undefined
+      if (!bucket) {
+        throw ERRORS.NoSuchBucket(bucketId)
+      }
+      versioningStatus = bucket.versioning_status ?? 'DISABLED'
+    }
+
+    return { versioningStatus, object: results[results.length - 1].rows[0] as Obj | undefined }
   }
 
   /**
@@ -3155,7 +3205,7 @@ export class StoragePgDB implements Database {
         if (scopeToRestore) {
           await this.applyScope(tnx, scope, scopeToRestore)
         }
-        await tnx.query(`RELEASE SAVEPOINT ${savepoint}`)
+        await releaseSavepoint(tnx, savepoint)
       }
 
       return result
@@ -4097,6 +4147,69 @@ function withReplacedRow(row: ReplacedRowColumns): WrittenObject {
   }
 }
 
+/**
+ * Waits for an object's advisory lock with a lock_timeout, in a single round trip: read the
+ * current timeout, set the new one, acquire, restore. MATERIALIZED forces each CTE to
+ * materialize before the next scans, which sequences the side-effecting set_config and
+ * pg_advisory_xact_lock calls in dependency order. Without MATERIALIZED the optimizer could
+ * inline and reorder volatile-function evaluation.
+ */
+function objectLockStatement(hash: number, lockTimeoutMs: number): DatabaseStatement {
+  return {
+    text: `
+          WITH previous_lock_timeout AS MATERIALIZED (
+            SELECT current_setting('lock_timeout') AS value
+          ),
+          set_lock_timeout AS MATERIALIZED (
+            SELECT
+              set_config('lock_timeout', $2, true) AS applied_timeout,
+              value
+            FROM previous_lock_timeout
+          ),
+          acquire_lock AS MATERIALIZED (
+            SELECT
+              pg_advisory_xact_lock($1),
+              applied_timeout,
+              value
+            FROM set_lock_timeout
+          ),
+          restore_lock_timeout AS MATERIALIZED (
+            SELECT set_config('lock_timeout', value, true) AS restored_timeout
+            FROM acquire_lock
+          )
+          SELECT true AS locked
+          FROM restore_lock_timeout
+        `,
+    values: [hash, `${lockTimeoutMs}ms`],
+  }
+}
+
+/**
+ * The transaction of a single statement executor: its one statement is the whole
+ * transaction, so there is nothing left to commit or roll back.
+ */
+class SingleStatementTransaction implements DatabaseTransaction {
+  private used = false
+
+  constructor(private readonly executor: DatabaseExecutor) {}
+
+  isCompleted(): boolean {
+    return this.used
+  }
+
+  query<T extends QueryResultRow = QueryResultRow>(
+    statement: string | DatabaseStatement,
+    options?: Parameters<DatabaseExecutor['query']>[1]
+  ): Promise<QueryResult<T>> {
+    this.used = true
+    return this.executor.query<T>(statement, options)
+  }
+
+  async commit(): Promise<void> {}
+
+  async rollback(): Promise<void> {}
+}
+
 function objectLockHash(bucketId: string, objectName: string, version?: string): number {
   return hashStringToInt(`${bucketId}/${objectName}${version ? `/${version}` : ''}`)
 }
@@ -4222,8 +4335,15 @@ function nextSavepointName(): string {
   return quoteIdentifier(`storage_pg_query_${randomUUID().replace(/-/g, '_')}`)
 }
 
+// Savepoint commands return nothing anyone reads: on transactions that defer such statements
+// (Database Watt) they travel with the next query or with COMMIT instead of on their own.
 async function createSavepoint(tnx: DatabaseTransaction, savepoint: string): Promise<void> {
   const query = `SAVEPOINT ${savepoint}`
+
+  if (tnx.defer) {
+    tnx.defer({ text: query })
+    return
+  }
 
   try {
     await tnx.query(query)
@@ -4233,8 +4353,21 @@ async function createSavepoint(tnx: DatabaseTransaction, savepoint: string): Pro
 }
 
 async function rollbackSavepoint(tnx: DatabaseTransaction, savepoint: string): Promise<void> {
-  await tnx.query(`ROLLBACK TO SAVEPOINT ${savepoint}`)
-  await tnx.query(`RELEASE SAVEPOINT ${savepoint}`)
+  await runOrDefer(tnx, `ROLLBACK TO SAVEPOINT ${savepoint}`)
+  await runOrDefer(tnx, `RELEASE SAVEPOINT ${savepoint}`)
+}
+
+async function releaseSavepoint(tnx: DatabaseTransaction, savepoint: string): Promise<void> {
+  await runOrDefer(tnx, `RELEASE SAVEPOINT ${savepoint}`)
+}
+
+async function runOrDefer(tnx: DatabaseTransaction, text: string): Promise<void> {
+  if (tnx.defer) {
+    tnx.defer({ text })
+    return
+  }
+
+  await tnx.query(text)
 }
 
 function mapLifecycleState(row: LifecycleStateRow): LifecycleState {

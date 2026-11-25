@@ -11,6 +11,7 @@ import {
   type DatabaseErrorResponse,
   type DatabaseMessageName,
   type DatabaseMessageRequest,
+  type LockedBatchRequest,
   type LockedQueryRequest,
   type QueryField,
   type QueryRequest,
@@ -66,6 +67,10 @@ export interface DatabaseWattTransport {
     request: BatchRequest,
     options?: DatabaseWattRequestOptions
   ): Promise<DatabaseWattBatchResponse>
+  lockedBatch(
+    request: LockedBatchRequest,
+    options?: DatabaseWattRequestOptions
+  ): Promise<DatabaseWattBatchResponse>
   lockedQuery<Row = unknown>(
     request: LockedQueryRequest,
     options?: DatabaseWattRequestOptions
@@ -115,6 +120,16 @@ export class DatabaseWattClient implements DatabaseWattTransport {
           this.rollbackTransaction({ lockId }).catch(() => undefined)
         }
       },
+    })
+  }
+
+  lockedBatch(
+    request: LockedBatchRequest,
+    options?: DatabaseWattRequestOptions
+  ): Promise<DatabaseWattBatchResponse> {
+    return this.send(DATABASE_MESSAGES.lockedBatch, request, parseBatchResponse, {
+      ...options,
+      lockId: request.lockId,
     })
   }
 

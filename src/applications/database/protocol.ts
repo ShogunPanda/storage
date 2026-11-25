@@ -6,6 +6,7 @@ export const DATABASE_MESSAGES = {
   beginTransaction: 'database.beginTransaction',
   cancel: 'database.cancel',
   commitTransaction: 'database.commitTransaction',
+  lockedBatch: 'database.lockedBatch',
   lockedQuery: 'database.lockedQuery',
   query: 'database.query',
   release: 'database.release',
@@ -114,6 +115,8 @@ export type BeginTransactionRequest = WireRequestMeta & TransactionStartRequest
 
 export type CommitTransactionRequest = WireRequestMeta & {
   lockId: string
+  /** Statements the caller deferred, run before COMMIT and written with it. */
+  statements?: BatchStatement[]
 }
 
 export type RollbackTransactionRequest = WireRequestMeta & {
@@ -156,15 +159,26 @@ export type BatchStatement = {
 /**
  * Opens a transaction and runs `statements` in it with one message. With `commit` the
  * transaction is committed and its connection released (a whole single-statement
- * transaction); without it the transaction stays open and its lock ID is returned.
- * The response carries the result of the last statement, plus, in `results`, the
- * results of the statements flagged with `result`, in order.
+ * transaction), with `rollback` it is rolled back and released (a permission probe, whose
+ * answer is whether the statements succeed); with neither it stays open and its lock ID
+ * is returned. The response carries the result of the last statement, plus, in
+ * `results`, the results of the statements flagged with `result`, in order.
  */
 export type BatchRequest = WireRequestMeta &
   TransactionStartRequest & {
     statements: BatchStatement[]
     commit: boolean
+    rollback?: boolean
   }
+
+/**
+ * Runs `statements` in an open transaction with one message: the response is the same as
+ * a BatchRequest's, without a lock ID.
+ */
+export type LockedBatchRequest = WireRequestMeta & {
+  lockId: string
+  statements: BatchStatement[]
+}
 
 export type BatchResponse = RawQueryResponse & {
   lockId?: string
@@ -191,6 +205,10 @@ export type DatabaseProtocol = {
   [DATABASE_MESSAGES.commitTransaction]: {
     request: CommitTransactionRequest
     response: { committed: boolean }
+  }
+  [DATABASE_MESSAGES.lockedBatch]: {
+    request: LockedBatchRequest
+    response: BatchResponse
   }
   [DATABASE_MESSAGES.lockedQuery]: {
     request: LockedQueryRequest

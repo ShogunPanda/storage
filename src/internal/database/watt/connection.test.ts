@@ -45,6 +45,7 @@ describe('Watt PostgreSQL connection adapter', () => {
       query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: 1 }] }),
       acquire: vi.fn(),
       batch: vi.fn(),
+      lockedBatch: vi.fn(),
       lockedQuery: vi.fn(),
       release: vi.fn(),
       beginTransaction: vi.fn(),
@@ -158,23 +159,114 @@ describe('Watt PostgreSQL connection adapter', () => {
     expect(statements[1]).toMatchObject({ sql: 'SELECT 1' })
   })
 
-  it('sends the scope as a query once the transaction has started', async () => {
+  it('sends a scope set after the transaction started with the next query', async () => {
     const { sent } = installWattMessagingMock({
       'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
-      'database.lockedQuery': { rowCount: 0, rows: [] },
+      'database.lockedBatch': {
+        rowCount: 1,
+        rows: [['1']],
+        fields: [{ name: 'n', dataTypeID: 23 }],
+      },
     })
     const connection = await getWattPostgresConnection(createConnectionOptions())
 
     const tx = await connection.transaction()
-    await tx.query('SAVEPOINT a')
+    await tx.query('SELECT 0')
     await connection.asSuperUser().setScope(tx)
+    const result = await tx.query('SELECT 1 AS n')
 
     expect(sent.map((message) => message.message)).toEqual([
       'database.batch',
-      'database.lockedQuery',
+      'database.lockedBatch',
     ])
-    expect(sent[1].data.sql).toContain("set_config('role', $1, true)")
-    expect((sent[1].data.values as unknown[])[0]).toBe('service_role')
+    const statements = sent[1].data.statements as Array<{ sql: string; values?: unknown[] }>
+    expect(statements).toHaveLength(2)
+    expect(statements[0].sql).toContain("set_config('role', $1, true)")
+    expect(statements[0].values?.[0]).toBe('service_role')
+    expect(statements[1]).toEqual({ sql: 'SELECT 1 AS n', values: undefined })
+    expect(result.rows).toEqual([{ n: 1 }])
+  })
+
+  it('sends deferred statements with COMMIT and drops them on ROLLBACK', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
+      'database.commitTransaction': { committed: true },
+      'database.rollbackTransaction': { rolledBack: true },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+
+    const committed = await connection.transaction()
+    await committed.query('SELECT 1')
+    committed.defer?.({ text: 'RELEASE SAVEPOINT a' })
+    await committed.commit()
+
+    const rolledBack = await connection.transaction()
+    await rolledBack.query('SELECT 1')
+    rolledBack.defer?.({ text: 'ROLLBACK TO SAVEPOINT a' })
+    await rolledBack.rollback()
+
+    expect(sent.map((message) => message.message)).toEqual([
+      'database.batch',
+      'database.commitTransaction',
+      'database.batch',
+      'database.rollbackTransaction',
+    ])
+    expect(sent[1].data).toMatchObject({
+      lockId: 'lock-a',
+      statements: [{ sql: 'RELEASE SAVEPOINT a' }],
+    })
+    expect(sent[3].data).not.toHaveProperty('statements')
+  })
+
+  it('runs a batch of queries in the message that opens the transaction', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': {
+        lockId: 'lock-a',
+        rowCount: 1,
+        rows: [['3']],
+        fields: [{ name: 'n', dataTypeID: 23 }],
+        results: [
+          { rowCount: 1, rows: [['1']], fields: [{ name: 'n', dataTypeID: 23 }] },
+          { rowCount: 1, rows: [['2']], fields: [{ name: 'n', dataTypeID: 23 }] },
+        ],
+      },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+
+    const tx = await connection.transaction()
+    await connection.setScope(tx)
+    const results = await tx.queryBatch?.([
+      { text: 'SELECT 1 AS n' },
+      { text: 'SELECT 2 AS n' },
+      { text: 'SELECT 3 AS n' },
+    ])
+
+    expect(results?.map((result) => result.rows[0].n)).toEqual([1, 2, 3])
+    expect(sent).toHaveLength(1)
+    const statements = sent[0].data.statements as Array<{ sql: string; result?: boolean }>
+    // The scope (with the transaction's settings folded in), then the queries.
+    expect(statements.map((statement) => statement.result)).toEqual([
+      undefined,
+      true,
+      true,
+      undefined,
+    ])
+    expect(statements[0].sql).toContain("set_config('role', $1, true)")
+  })
+
+  it('runs a permission probe as one batch that rolls back', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': { rowCount: 1, rows: [] },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+
+    await connection.rollbackStatementExecutor?.().query('INSERT INTO t VALUES (1)')
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0].data).toMatchObject({ commit: false, rollback: true })
+    expect((sent[0].data.statements as Array<{ sql: string }>).at(-1)?.sql).toBe(
+      'INSERT INTO t VALUES (1)'
+    )
   })
 
   it('opens the transaction only once for concurrent first queries', async () => {

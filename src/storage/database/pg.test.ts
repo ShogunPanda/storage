@@ -2669,3 +2669,190 @@ describe('StoragePgDB findBucketAndObject', () => {
     await expect(db.findBucketAndObject(query)).rejects.toBeDefined()
   })
 })
+
+describe('StoragePgDB single-message permission probes', () => {
+  function createProbeFixture(rollbackStatementExecutor?: ReturnType<typeof vi.fn>) {
+    const fixture = createTestPermissionFixture()
+    Object.assign(fixture.connection, { getAbortSignal: () => undefined })
+    if (rollbackStatementExecutor) {
+      Object.assign(fixture.connection, { rollbackStatementExecutor })
+    }
+    return fixture
+  }
+
+  test('runs a single-statement probe through a transaction that rolls itself back', async () => {
+    const probe = { query: vi.fn().mockResolvedValue({ rows: [], rowCount: 1 }) }
+    const rollbackStatementExecutor = vi.fn().mockReturnValue(probe)
+    const { connection, storage } = createProbeFixture(rollbackStatementExecutor)
+
+    const result = await storage.testPermission(
+      (db) =>
+        db.createObject({
+          bucket_id: 'b',
+          name: 'a.txt',
+          owner: undefined,
+          metadata: {},
+          version: 'v1',
+        }),
+      { singleStatement: true }
+    )
+
+    expect(result).toMatchObject({ bucket_id: 'b', name: 'a.txt' })
+    expect(rollbackStatementExecutor).toHaveBeenCalledTimes(1)
+    expect(probe.query).toHaveBeenCalledTimes(1)
+    expect(probe.query.mock.calls[0][0].text).toContain('INSERT INTO storage.objects')
+    // The executor carries BEGIN, the scope and ROLLBACK itself.
+    expect(connection.transaction).not.toHaveBeenCalled()
+    expect(connection.setScope).not.toHaveBeenCalled()
+  })
+
+  test('maps the failure of a single-statement probe like a regular one', async () => {
+    const denied = Object.assign(
+      new DatabaseError('new row violates row-level security policy', 1, 'error'),
+      {
+        code: '42501',
+      }
+    )
+    const probe = { query: vi.fn().mockRejectedValue(denied) }
+    const { storage } = createProbeFixture(vi.fn().mockReturnValue(probe))
+
+    await expect(
+      storage.testPermission(
+        (db) =>
+          db.createObject({
+            bucket_id: 'b',
+            name: 'a.txt',
+            owner: undefined,
+            metadata: {},
+            version: 'v1',
+          }),
+        { singleStatement: true }
+      )
+    ).rejects.toMatchObject({ code: 'AccessDenied' })
+  })
+
+  test('opens a regular transaction without the flag or without a probe executor', async () => {
+    const rollbackStatementExecutor = vi.fn()
+    const withExecutor = createProbeFixture(rollbackStatementExecutor)
+    await withExecutor.storage.testPermission(async () => 'allowed')
+    expect(rollbackStatementExecutor).not.toHaveBeenCalled()
+    expect(withExecutor.transaction.rollback).toHaveBeenCalledTimes(1)
+
+    const withoutExecutor = createProbeFixture()
+    await withoutExecutor.storage.testPermission(async () => 'allowed', { singleStatement: true })
+    expect(withoutExecutor.transaction.rollback).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('StoragePgDB lockObjectForWrite', () => {
+  const options = {
+    lockTimeout: 5000,
+    objectColumns: 'id, version, is_delete_marker',
+    versioning: true,
+  }
+
+  function createLockFixture(queryBatch?: ReturnType<typeof vi.fn>) {
+    const { storage } = createQueryCaptureStorage('unlock-object-versioning')
+    const tnx = {
+      query: vi.fn().mockResolvedValue({ rows: [{ versioning_status: 'ENABLED' }], rowCount: 1 }),
+      commit: vi.fn(),
+      rollback: vi.fn(),
+      isCompleted: vi.fn().mockReturnValue(false),
+      ...(queryBatch ? { queryBatch } : {}),
+    }
+    const db = new StoragePgDB(storage.connection, {
+      tenantId: 'lock-for-write-tenant',
+      host: 'localhost',
+      latestMigration: 'unlock-object-versioning',
+      tnx: tnx as unknown as DatabaseTransaction,
+      scope: { applied: storage.connection },
+    })
+    return { db, tnx }
+  }
+
+  test('locks and reads the bucket and the object in one batch', async () => {
+    const object = { id: 'object-a', version: 'v1', is_delete_marker: false }
+    const queryBatch = vi.fn().mockResolvedValue([
+      { rows: [{ locked: true }], rowCount: 1 },
+      { rows: [{ versioning_status: 'SUSPENDED' }], rowCount: 1 },
+      { rows: [object], rowCount: 1 },
+    ])
+    const { db, tnx } = createLockFixture(queryBatch)
+
+    await expect(db.lockObjectForWrite('bucket-a', 'a.txt', options)).resolves.toEqual({
+      versioningStatus: 'SUSPENDED',
+      object,
+    })
+
+    expect(tnx.query).not.toHaveBeenCalled()
+    const [statements] = queryBatch.mock.calls[0]
+    expect(statements).toHaveLength(3)
+    expect(statements[0].text).toContain('pg_advisory_xact_lock($1)')
+    expect(statements[0].values[1]).toBe('5000ms')
+    expect(statements[1].text).toMatch(/FROM storage\.buckets[\s\S]*FOR SHARE/)
+    expect(statements[1].values).toEqual(['bucket-a'])
+    expect(statements[2].text).toMatch(/FROM storage\.objects[\s\S]*FOR UPDATE/)
+  })
+
+  test('skips the bucket read without versioning', async () => {
+    const queryBatch = vi.fn().mockResolvedValue([
+      { rows: [{ locked: true }], rowCount: 1 },
+      { rows: [], rowCount: 0 },
+    ])
+    const { db } = createLockFixture(queryBatch)
+
+    await expect(
+      db.lockObjectForWrite('bucket-a', 'a.txt', { ...options, versioning: false })
+    ).resolves.toEqual({ versioningStatus: 'DISABLED', object: undefined })
+    expect(queryBatch.mock.calls[0][0]).toHaveLength(2)
+  })
+
+  test('reports a missing bucket and a lock timeout like the separate reads', async () => {
+    const missing = createLockFixture(
+      vi.fn().mockResolvedValue([
+        { rows: [{ locked: true }], rowCount: 1 },
+        { rows: [], rowCount: 0 },
+        { rows: [], rowCount: 0 },
+      ])
+    )
+    await expect(missing.db.lockObjectForWrite('bucket-a', 'a.txt', options)).rejects.toMatchObject(
+      { code: 'NoSuchBucket' }
+    )
+
+    const timeout = createLockFixture(
+      vi.fn().mockRejectedValue(createPgError('55P03', 'canceling statement due to lock timeout'))
+    )
+    await expect(timeout.db.lockObjectForWrite('bucket-a', 'a.txt', options)).rejects.toMatchObject(
+      { code: 'LockTimeout' }
+    )
+  })
+
+  test('takes the steps in turn when the transaction cannot batch', async () => {
+    const { db, tnx } = createLockFixture()
+
+    await db.lockObjectForWrite('bucket-a', 'a.txt', options)
+
+    const texts = tnx.query.mock.calls.map(([statement]) => statement.text)
+    expect(texts).toHaveLength(3)
+    expect(texts[0]).toContain('pg_advisory_xact_lock($1)')
+    expect(texts[1]).toMatch(/FOR SHARE/)
+    expect(texts[2]).toMatch(/FOR UPDATE/)
+  })
+})
+
+describe('StoragePgDB deferred savepoint commands', () => {
+  test('defers SAVEPOINT, ROLLBACK TO and RELEASE on transactions that defer', async () => {
+    const { storage, transaction } = createNestedTestPermissionFixture()
+    const defer = vi.fn()
+    Object.assign(transaction, { defer })
+
+    await expect(storage.testPermission(async () => 'allowed')).resolves.toBe('allowed')
+
+    expect(transaction.query).not.toHaveBeenCalled()
+    expect(defer.mock.calls.map(([statement]) => statement.text)).toEqual([
+      expect.stringMatching(/^SAVEPOINT "storage_pg_query_/),
+      expect.stringMatching(/^ROLLBACK TO SAVEPOINT "storage_pg_query_/),
+      expect.stringMatching(/^RELEASE SAVEPOINT "storage_pg_query_/),
+    ])
+  })
+})
