@@ -609,6 +609,127 @@ describe('Database Watt application loopback integration', () => {
     }
   })
 
+  it("runs a batched read's object policies only where the regular reads run them", async () => {
+    const suffix = randomUUID().replaceAll('-', '').slice(0, 12)
+    const role = `dbwatt_probe_${suffix}`
+    const probe = `public.dbwatt_probe_${suffix}`
+    const calls = `public.dbwatt_probe_calls_${suffix}`
+    const privateBucket = uniqueBucketName('gate-private')
+    const publicBucket = uniqueBucketName('gate-public')
+    const missingBucket = uniqueBucketName('gate-missing')
+    const objectName = 'folder/a.txt'
+    const destination = testDestination()
+    const run = (statements: Array<{ sql: string; values?: unknown[] }>) =>
+      checkedResult(
+        sendDatabaseMessage('database.batch', { destination, statements, commit: true })
+      )
+    const probeCalls = async () => {
+      const response = await checkedResult<QueryRowsResponse>(
+        sendDatabaseMessage('database.query', {
+          destination,
+          sql: `SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS n FROM ${calls}`,
+        })
+      )
+      return Number(decodeRows<{ n: string }>(response)[0].n)
+    }
+
+    // A role whose only policy on storage.objects counts every time it is evaluated.
+    await run([
+      { sql: `CREATE ROLE ${role} NOLOGIN` },
+      { sql: `GRANT ${role} TO CURRENT_USER` },
+      { sql: `GRANT USAGE ON SCHEMA storage TO ${role}` },
+      { sql: `GRANT SELECT ON storage.objects TO ${role}` },
+      { sql: `CREATE SEQUENCE ${calls}` },
+      {
+        sql: `CREATE FUNCTION ${probe}() RETURNS boolean LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+              AS $$ BEGIN PERFORM nextval('${calls}'); RETURN true; END $$`,
+      },
+      { sql: `CREATE POLICY ${role} ON storage.objects FOR SELECT TO ${role} USING (${probe}())` },
+      {
+        sql: 'INSERT INTO storage.buckets (id, name, public) VALUES ($1, $1, false), ($2, $2, true)',
+        values: [privateBucket, publicBucket],
+      },
+      {
+        sql: `INSERT INTO storage.objects (bucket_id, name, version) VALUES ($1, $3, $4), ($2, $3, $5)`,
+        values: [privateBucket, publicBucket, objectName, randomUUID(), randomUUID()],
+      },
+    ])
+
+    try {
+      const connection = await getWattPostgresConnection(
+        {
+          dbUrl: destination.connectionString,
+          isExternalPool: destination.isExternalPool,
+          maxConnections: destination.maxConnections,
+          tenantId: destination.id,
+          operation: () => 'storage.object.get',
+          superUser: { jwt: '', payload: { role: 'service_role' } },
+          user: { jwt: '', payload: { role, sub: randomUUID() } },
+        },
+        loopbackTransport()
+      )
+      const db = new StoragePgDB(connection, {
+        tenantId: destination.id,
+        host: 'localhost',
+        latestMigration: latestDBMigration(),
+      })
+      const regularRead = { excludeDeleteMarkers: true, dontErrorOnEmpty: true }
+
+      for (const [bucketId, policyRuns] of [
+        [privateBucket, 1],
+        [publicBucket, 0],
+        [missingBucket, 0],
+      ] as const) {
+        await resetDatabaseWattStats()
+        const before = await probeCalls()
+        const batched = await db.findBucketAndObject({
+          bucketId,
+          bucketColumns: 'id,public',
+          objectName,
+          objectColumns: 'id,name,version',
+          objectFilters: { excludeDeleteMarkers: true },
+          objectAsSuperUser: false,
+        })
+        const afterBatched = await probeCalls()
+        expect((await getDatabaseWattStats()).batch).toBe(1)
+
+        const bucket = await db
+          .asSuperUser()
+          .findBucketById(bucketId, 'id,public', { dontErrorOnEmpty: true })
+        const object = bucket
+          ? await (bucket.public ? db.asSuperUser() : db).findObject(
+              bucketId,
+              objectName,
+              'id,name,version',
+              regularRead
+            )
+          : undefined
+        const afterRegular = await probeCalls()
+
+        expect(batched).toEqual({ bucket, object })
+        expect(afterBatched - before).toBe(policyRuns)
+        expect(afterRegular - afterBatched).toBe(policyRuns)
+      }
+    } finally {
+      await run([
+        { sql: `SELECT set_config('storage.allow_delete_query', 'true', true)` },
+        {
+          sql: 'DELETE FROM storage.objects WHERE bucket_id IN ($1, $2)',
+          values: [privateBucket, publicBucket],
+        },
+        {
+          sql: 'DELETE FROM storage.buckets WHERE id IN ($1, $2)',
+          values: [privateBucket, publicBucket],
+        },
+        { sql: `DROP POLICY ${role} ON storage.objects` },
+        { sql: `DROP FUNCTION ${probe}()` },
+        { sql: `DROP SEQUENCE ${calls}` },
+        { sql: `DROP OWNED BY ${role}` },
+        { sql: `DROP ROLE ${role}` },
+      ])
+    }
+  })
+
   it('opens a transaction from a batch message and continues it by lock', async () => {
     const bucketName = uniqueBucketName('dbwatt-batch-open')
 

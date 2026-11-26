@@ -136,7 +136,11 @@ export interface BucketAndObjectQuery {
     'excludeDeleteMarkers' | 'includeNoncurrent' | 'isVersioned'
   >
   version?: string
-  /** Read the object with the super user's scope instead of this database's. */
+  /**
+   * Read the object with the super user's scope. Otherwise it is read as findObject would read
+   * it after the bucket: with the super user's scope in a public bucket, with this database's in
+   * a private one.
+   */
   objectAsSuperUser: boolean
 }
 

@@ -5,6 +5,7 @@ import {
   type DatabaseTransaction,
   quoteIdentifier,
   quoteQualifiedIdentifier,
+  type ScopedStatement,
   type TenantConnection,
   type TransactionOptions,
 } from '@internal/database'
@@ -707,9 +708,14 @@ export class StoragePgDB implements Database {
   private async findBucketByIdStatement(
     bucketId: string,
     columns: string,
-    filters?: FindBucketFilters
+    filters?: FindBucketFilters,
+    setPublicGate = false
   ): Promise<DatabaseStatement> {
-    const selectedColumns = selectColumns(columns, await this.getBucketColumnPolicy())
+    let selectedColumns = selectColumns(columns, await this.getBucketColumnPolicy())
+    if (setPublicGate) {
+      // In the target list, so it runs for the bucket row only, from the same snapshot.
+      selectedColumns += `, set_config('${BUCKET_PUBLIC_SETTING}', public::text, true) AS ${BUCKET_PUBLIC_COLUMN}`
+    }
     const conditions = ['id = $1']
     const values: unknown[] = [bucketId]
 
@@ -731,40 +737,71 @@ export class StoragePgDB implements Database {
   }
 
   /**
-   * Reads a bucket with the super user's scope and an object in it with the super user's
-   * scope (`objectAsSuperUser`) or this database's, in one round trip on connections that
-   * support it (Database Watt). It resolves to undefined when the connection cannot, inside
-   * a transaction, and when the batch fails in a way that findBucketById followed by
-   * findObject might not: callers then take that path, which gives the regular outcome.
+   * Reads a bucket (with the super user's scope) and an object in it in one round trip, on
+   * connections that support it (Database Watt). With `objectAsSuperUser` the object is read
+   * with the super user's scope. Otherwise it is read as findObject would read it after the
+   * bucket: with the super user's scope in a public bucket and with this database's in a
+   * private one. Both of those reads are in the batch, gated on the bucket row read in the same
+   * transaction, so only the one the bucket calls for runs, and the object's RLS policies run
+   * exactly where findObject would run them: not in a public bucket, nor without a bucket.
+   *
+   * It resolves to undefined when the connection cannot batch, inside a transaction, on
+   * Multigres (which takes set_config only as a plain top-level statement), and when the batch
+   * fails in a way that findBucketById followed by findObject might not: callers then take that
+   * path, which gives the regular outcome.
    */
   async findBucketAndObject(query: BucketAndObjectQuery): Promise<BucketAndObject | undefined> {
     if (!this.connection.scopedBatch || this.options.tnx || this.options.parentTnx) {
       return undefined
     }
 
-    const [bucketStatement, objectStatement] = await Promise.all([
-      this.findBucketByIdStatement(query.bucketId, query.bucketColumns),
+    const gated = !query.objectAsSuperUser
+    if (gated && this.isMultigresDatabase()) {
+      return undefined
+    }
+
+    const objectStatement = (onlyIfBucketPublic?: boolean) =>
       this.findObjectStatement(
         query.bucketId,
         query.objectName,
         query.objectColumns,
         query.objectFilters,
-        query.version
-      ),
-    ])
+        query.version,
+        onlyIfBucketPublic
+      )
+
+    const statements: ScopedStatement[] = gated
+      ? await Promise.all([
+          this.findBucketByIdStatement(query.bucketId, query.bucketColumns, undefined, true).then(
+            (statement) => ({ ...statement, asSuperUser: true })
+          ),
+          objectStatement(true).then((statement) => ({ ...statement, asSuperUser: true })),
+          objectStatement(false).then((statement) => ({ ...statement, asSuperUser: false })),
+        ])
+      : await Promise.all([
+          this.findBucketByIdStatement(query.bucketId, query.bucketColumns).then((statement) => ({
+            ...statement,
+            asSuperUser: true,
+          })),
+          objectStatement().then((statement) => ({ ...statement, asSuperUser: true })),
+        ])
 
     const queryName = 'FindBucketAndObject'
     const abortSignal = this.connection.getAbortSignal()
     const recordDuration = this.createDurationRecorder(queryName, performance.now(), abortSignal)
     try {
-      const [buckets, objects] = await this.connection.scopedBatch([
-        { ...bucketStatement, asSuperUser: true },
-        { ...objectStatement, asSuperUser: query.objectAsSuperUser },
-      ])
-      return {
-        bucket: buckets.rows[0] as Bucket | undefined,
-        object: objects.rows[0] as Obj | undefined,
+      const results = await this.connection.scopedBatch(statements)
+      const bucketRow = results[0].rows[0] as (Bucket & Record<string, unknown>) | undefined
+      if (!gated) {
+        return { bucket: bucketRow, object: results[1].rows[0] as Obj | undefined }
       }
+
+      if (!bucketRow) {
+        return { bucket: undefined, object: undefined }
+      }
+      const { [BUCKET_PUBLIC_COLUMN]: bucketPublic, ...bucket } = bucketRow
+      const objectRead = bucketPublic === 'true' ? results[1] : results[2]
+      return { bucket: bucket as Bucket, object: objectRead.rows[0] as Obj | undefined }
     } catch (e) {
       if (regularPathMayDiffer(e)) {
         return undefined
@@ -2176,11 +2213,19 @@ export class StoragePgDB implements Database {
     objectName: string,
     columns: string,
     filters?: FindObjectFilters,
-    version?: string | null
+    version?: string | null,
+    onlyIfBucketPublic?: boolean
   ): Promise<DatabaseStatement> {
     const selectedColumns = selectColumns(columns, await this.getObjectColumnPolicy())
     const conditions = ['name COLLATE "C" = $1', 'bucket_id = $2']
     const values: unknown[] = [objectName, bucketId]
+    if (onlyIfBucketPublic !== undefined) {
+      // Variable-free, so PostgreSQL checks it once, before the scan (a One-Time Filter): when
+      // it is false, no row is read and no RLS policy is evaluated.
+      conditions.push(
+        `current_setting('${BUCKET_PUBLIC_SETTING}', true) = '${onlyIfBucketPublic ? 'true' : 'false'}'`
+      )
+    }
 
     const hasVersioning = await this.hasMigration('object-versioning-core')
     if (version === null) {
@@ -4179,6 +4224,10 @@ function mapPgError(error: unknown, context?: string | PgErrorContext): unknown 
 
   return error
 }
+
+// Set by findBucketAndObject's bucket read for the object reads behind it, in its transaction.
+const BUCKET_PUBLIC_SETTING = 'storage.lookup_bucket_public'
+const BUCKET_PUBLIC_COLUMN = 'lookup_bucket_public'
 
 /**
  * Whether a failed findBucketAndObject batch may have failed where findBucketById followed

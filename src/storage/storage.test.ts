@@ -84,7 +84,7 @@ describe('Storage.findBucketAndObject', () => {
     return { db, storage, superUserDb }
   }
 
-  it('reads the bucket and the object as the super user in one round trip for a public bucket', async () => {
+  it('reads the bucket and the object in one round trip, as the bucket calls for', async () => {
     const { db, storage, superUserDb } = createLookup({
       bucket: publicBucket,
       object: { id: 'batched' } as never,
@@ -99,7 +99,7 @@ describe('Storage.findBucketAndObject', () => {
       objectColumns: 'id',
       objectFilters: { excludeDeleteMarkers: true },
       version: 'v1',
-      objectAsSuperUser: true,
+      objectAsSuperUser: false,
     })
     expect(lookup.bucket).toEqual({ id: 'bucket', public: true })
     await expect(lookup.findObject()).resolves.toEqual({ id: 'batched' })
@@ -108,8 +108,24 @@ describe('Storage.findBucketAndObject', () => {
     expect(db.findObject).not.toHaveBeenCalled()
   })
 
-  it('reports a missing object of a public bucket without reading it again', async () => {
-    const { db, storage, superUserDb } = createLookup({ bucket: publicBucket })
+  it('uses the batched row of a private bucket too: the database read it with RLS', async () => {
+    const { db, storage, superUserDb } = createLookup({
+      bucket: privateBucket,
+      object: { id: 'batched-with-rls' } as never,
+    })
+
+    const lookup = await storage.findBucketAndObject('bucket', 'a.txt', 'id')
+
+    await expect(lookup.findObject()).resolves.toEqual({ id: 'batched-with-rls' })
+    expect(db.findObject).not.toHaveBeenCalled()
+    expect(superUserDb.findObject).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['public', publicBucket],
+    ['private', privateBucket],
+  ])('reports a missing object of a %s bucket without reading it again', async (_, bucket) => {
+    const { db, storage, superUserDb } = createLookup({ bucket })
 
     const lookup = await storage.findBucketAndObject('bucket', 'a.txt', 'id')
 
@@ -118,26 +134,7 @@ describe('Storage.findBucketAndObject', () => {
     expect(db.findObject).not.toHaveBeenCalled()
   })
 
-  it('never uses the super user row for a private bucket: it reads the object again with RLS', async () => {
-    const { db, storage, superUserDb } = createLookup({
-      bucket: privateBucket,
-      object: { id: 'batched-as-super-user' } as never,
-    })
-
-    const lookup = await storage.findBucketAndObject('bucket', 'a.txt', 'id', { version: 'v1' })
-
-    await expect(lookup.findObject()).resolves.toEqual({ id: 'read-with-rls' })
-    expect(db.findObject).toHaveBeenCalledWith(
-      'bucket',
-      'a.txt',
-      'id',
-      { excludeDeleteMarkers: true },
-      'v1'
-    )
-    expect(superUserDb.findObject).not.toHaveBeenCalled()
-  })
-
-  it('uses the super user row for a private bucket when asked to read as the super user', async () => {
+  it('asks for the object as the super user when told to', async () => {
     const { db, storage } = createLookup({
       bucket: privateBucket,
       object: { id: 'batched' } as never,
@@ -147,30 +144,34 @@ describe('Storage.findBucketAndObject', () => {
       objectAsSuperUser: true,
     })
 
+    expect(db.findBucketAndObject).toHaveBeenCalledWith(
+      expect.objectContaining({ objectAsSuperUser: true })
+    )
     await expect(lookup.findObject()).resolves.toEqual({ id: 'batched' })
     expect(db.findObject).not.toHaveBeenCalled()
   })
 
-  it('remembers nothing between calls: a bucket made private is read with RLS right away', async () => {
-    const { db, storage } = createLookup({
-      bucket: publicBucket,
-      object: { id: 'batched' } as never,
-    })
+  it('remembers nothing between calls: each one reads the bucket again', async () => {
+    const { db, storage } = createLookup(undefined)
     vi.mocked(db.findBucketAndObject).mockResolvedValueOnce({
       bucket: publicBucket,
-      object: { id: 'batched' } as never,
+      object: { id: 'read-as-super-user' } as never,
     })
     vi.mocked(db.findBucketAndObject).mockResolvedValueOnce({
       bucket: privateBucket,
-      object: { id: 'batched' } as never,
+      object: { id: 'read-with-rls' } as never,
     })
 
     const first = await storage.findBucketAndObject('bucket', 'a.txt', 'id')
     const second = await storage.findBucketAndObject('bucket', 'a.txt', 'id')
 
-    await expect(first.findObject()).resolves.toEqual({ id: 'batched' })
+    expect(first.bucket).toEqual(publicBucket)
+    expect(second.bucket).toEqual(privateBucket)
     await expect(second.findObject()).resolves.toEqual({ id: 'read-with-rls' })
     expect(db.findBucketAndObject).toHaveBeenCalledTimes(2)
+    expect(
+      vi.mocked(db.findBucketAndObject).mock.calls.map(([query]) => query.objectAsSuperUser)
+    ).toEqual([false, false])
   })
 
   it('returns no bucket when there is none', async () => {

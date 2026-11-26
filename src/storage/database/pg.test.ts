@@ -2590,47 +2590,119 @@ describe('StoragePgDB findBucketAndObject', () => {
     return { db, storage, transaction }
   }
 
-  test('reads both with the statements of findBucketById and findObject in one batch', async () => {
+  const gateColumn =
+    ", set_config('storage.lookup_bucket_public', public::text, true) AS lookup_bucket_public"
+  const gate = (value: 'true' | 'false') =>
+    ` AND current_setting('storage.lookup_bucket_public', true) = '${value}'`
+
+  // The regular reads, captured from the transaction they run in without a batch.
+  async function regularStatements(
+    storage: StoragePgDB,
+    transaction: { query: ReturnType<typeof vi.fn> }
+  ) {
+    Object.assign(storage.connection, { scopedBatch: undefined })
+    transaction.query.mockClear()
+    await storage.findBucketById('bucket-a', 'id,public', { dontErrorOnEmpty: true })
+    await storage.findObject('bucket-a', 'folder/a.txt', 'id,version', {
+      excludeDeleteMarkers: true,
+      dontErrorOnEmpty: true,
+    })
+    return transaction.query.mock.calls.map(([statement]) => statement)
+  }
+
+  test('reads the bucket and the object, gated both ways, with the regular statements', async () => {
     const scopedBatch = vi.fn().mockResolvedValue([
-      { rows: [{ id: 'bucket-a', public: false }], rowCount: 1 },
+      { rows: [{ id: 'bucket-a', public: false, lookup_bucket_public: 'false' }], rowCount: 1 },
+      { rows: [], rowCount: 0 },
       { rows: [{ id: 'object-a', version: 'v1' }], rowCount: 1 },
     ])
     const { db, storage, transaction } = createFixture(scopedBatch)
 
     const result = await db.findBucketAndObject(query)
 
+    // The private bucket's object, read with this database's scope; the gate column is dropped.
     expect(result).toEqual({
       bucket: { id: 'bucket-a', public: false },
       object: { id: 'object-a', version: 'v1' },
     })
     expect(scopedBatch).toHaveBeenCalledTimes(1)
-    const [bucketRead, objectRead] = scopedBatch.mock.calls[0][0]
+    const [bucketRead, superUserRead, scopedRead] = scopedBatch.mock.calls[0][0]
+    const [bucketQuery, objectQuery] = await regularStatements(storage, transaction)
 
-    // The regular reads, captured from the transaction they run in without a batch.
-    Object.assign(storage.connection, { scopedBatch: undefined })
-    await storage.findBucketById('bucket-a', 'id,public', { dontErrorOnEmpty: true })
-    await storage.findObject('bucket-a', 'folder/a.txt', 'id,version', {
-      excludeDeleteMarkers: true,
-      dontErrorOnEmpty: true,
-    })
-    const [bucketQuery, objectQuery] = transaction.query.mock.calls.map(([statement]) => statement)
-
-    expect(bucketRead).toEqual({ ...bucketQuery, asSuperUser: true })
-    expect(objectRead).toEqual({ ...objectQuery, asSuperUser: false })
+    // Each read is the regular statement plus its gate.
+    expect(bucketRead.asSuperUser).toBe(true)
+    expect(bucketRead.values).toEqual(bucketQuery.values)
+    expect(bucketRead.text.replace(gateColumn, '')).toBe(bucketQuery.text)
+    expect(superUserRead.asSuperUser).toBe(true)
+    expect(superUserRead.values).toEqual(objectQuery.values)
+    expect(superUserRead.text.replace(gate('true'), '')).toBe(objectQuery.text)
+    expect(scopedRead.asSuperUser).toBe(false)
+    expect(scopedRead.values).toEqual(objectQuery.values)
+    expect(scopedRead.text.replace(gate('false'), '')).toBe(objectQuery.text)
   })
 
-  test('reads the object as the super user when asked to', async () => {
+  test("keeps the super user read's object for a public bucket", async () => {
     const scopedBatch = vi.fn().mockResolvedValue([
+      { rows: [{ id: 'bucket-a', public: true, lookup_bucket_public: 'true' }], rowCount: 1 },
+      { rows: [{ id: 'object-a', version: 'v1' }], rowCount: 1 },
+      { rows: [], rowCount: 0 },
+    ])
+    const { db } = createFixture(scopedBatch)
+
+    await expect(db.findBucketAndObject(query)).resolves.toEqual({
+      bucket: { id: 'bucket-a', public: true },
+      object: { id: 'object-a', version: 'v1' },
+    })
+  })
+
+  test('returns neither without a bucket', async () => {
+    const scopedBatch = vi.fn().mockResolvedValue([
+      { rows: [], rowCount: 0 },
       { rows: [], rowCount: 0 },
       { rows: [], rowCount: 0 },
     ])
     const { db } = createFixture(scopedBatch)
 
+    await expect(db.findBucketAndObject(query)).resolves.toEqual({
+      bucket: undefined,
+      object: undefined,
+    })
+  })
+
+  test('reads the object as the super user, ungated, when asked to', async () => {
+    const scopedBatch = vi.fn().mockResolvedValue([
+      { rows: [], rowCount: 0 },
+      { rows: [], rowCount: 0 },
+    ])
+    const { db, storage, transaction } = createFixture(scopedBatch)
+
     await expect(db.findBucketAndObject({ ...query, objectAsSuperUser: true })).resolves.toEqual({
       bucket: undefined,
       object: undefined,
     })
-    expect(scopedBatch.mock.calls[0][0][1]).toMatchObject({ asSuperUser: true })
+    const [bucketRead, objectRead] = scopedBatch.mock.calls[0][0]
+    const [bucketQuery, objectQuery] = await regularStatements(storage, transaction)
+    expect(bucketRead).toEqual({ ...bucketQuery, asSuperUser: true })
+    expect(objectRead).toEqual({ ...objectQuery, asSuperUser: true })
+  })
+
+  test('takes the regular reads on Multigres unless the object is read as the super user', async () => {
+    const scopedBatch = vi.fn().mockResolvedValue([
+      { rows: [], rowCount: 0 },
+      { rows: [], rowCount: 0 },
+    ])
+    const { storage } = createFixture(scopedBatch)
+    const db = new StoragePgDB(storage.connection, {
+      tenantId: 'column-selection-tenant',
+      host: 'localhost',
+      latestMigration: 'unlock-object-versioning',
+      databaseEngine: 'multigres',
+    })
+
+    await expect(db.findBucketAndObject(query)).resolves.toBeUndefined()
+    expect(scopedBatch).not.toHaveBeenCalled()
+    await db.findBucketAndObject({ ...query, objectAsSuperUser: true })
+    expect(scopedBatch).toHaveBeenCalledTimes(1)
   })
 
   test('resolves to undefined when the connection cannot batch or inside a transaction', async () => {

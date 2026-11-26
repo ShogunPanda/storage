@@ -108,12 +108,10 @@ export class Storage {
    * this storage's scope otherwise. Callers check the bucket before calling findObject().
    *
    * That is what asSuperUser().findBucket() followed by findObject() gives. Where the
-   * database allows it, the bucket and the object are read together, both as the super
-   * user, in one round trip. That object row is only used where the regular reads also
-   * read the object as the super user (a public bucket, or `objectAsSuperUser`), decided
-   * from the bucket row read in the same round trip. Otherwise the object is read again
-   * with this storage's scope, so RLS is evaluated exactly where, and when, the regular
-   * reads evaluate it. Nothing is remembered between calls.
+   * database allows it, the bucket and the object are read together in one round trip: the
+   * object as the super user or with this storage's scope, as the bucket row read in the same
+   * transaction calls for (see Database.findBucketAndObject), so RLS is evaluated exactly
+   * where the regular reads evaluate it. Nothing is remembered between calls.
    */
   async findBucketAndObject(
     bucketId: string,
@@ -133,7 +131,7 @@ export class Storage {
             objectColumns,
             objectFilters: { excludeDeleteMarkers: true },
             version: options.version,
-            objectAsSuperUser: true,
+            objectAsSuperUser: forceSuperUser,
           })
         : undefined
 
@@ -144,17 +142,14 @@ export class Storage {
     return {
       bucket,
       findObject: async () => {
-        const asSuperUser = forceSuperUser || Boolean(bucket?.public)
-
-        if (batched?.bucket && asSuperUser) {
+        if (batched?.bucket) {
           if (!batched.object) {
             throw ERRORS.NoSuchKey(objectName)
           }
           return batched.object
         }
 
-        // The object row read as the super user is never used where this storage's scope
-        // applies: it is read again, with RLS.
+        const asSuperUser = forceSuperUser || Boolean(bucket?.public)
         const storage = asSuperUser ? this.asSuperUser() : this
         return storage
           .from(bucketId)
