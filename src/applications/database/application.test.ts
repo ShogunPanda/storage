@@ -1,6 +1,7 @@
 import { getMessaging } from '@platformatic/globals'
 import { setupLoopbackMessaging } from '@platformatic/runtime'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { BatchQuery } from './batch-query.js'
 import type { DatabaseErrorResponse } from './errors.js'
 import type { create } from './index.js'
 import { DATABASE_MESSAGES } from './protocol.js'
@@ -12,6 +13,12 @@ type MockClient = {
   queries: Array<{ sql: string; values?: unknown[] }>
   query: ReturnType<typeof vi.fn>
   release: ReturnType<typeof vi.fn>
+  // Set by the mocked cancelQuery: PostgreSQL interrupts the statement this backend runs.
+  cancelRequested?: boolean
+}
+
+class MockDatabaseError extends Error {
+  code?: string
 }
 
 type MockedEnvironment = {
@@ -40,31 +47,70 @@ function createMockClient(
   failures: { begin: number; sql?: string },
   held?: HeldStatement
 ): MockClient {
+  const run = async (config: string | QueryConfig, values?: unknown[]): Promise<MockResult> => {
+    const sql = typeof config === 'string' ? config : config.text
+    client.queries.push({ sql, values: typeof config === 'string' ? values : config.values })
+    if (sql === held?.sql) {
+      await held.until
+      if (client.cancelRequested) {
+        client.cancelRequested = false
+        throw Object.assign(new MockDatabaseError('canceling statement due to user request'), {
+          code: '57014',
+        })
+      }
+    }
+    if (sql.startsWith('BEGIN') && failures.begin > 0) {
+      failures.begin--
+      throw new Error('Connection terminated unexpectedly')
+    }
+    if (sql === failures.sql) {
+      throw new Error('relation "missing" does not exist')
+    }
+    // Statements run for storage workers use array row mode with raw text values.
+    if (typeof config !== 'string' && config.rowMode === 'array') {
+      return toRawResult(rows)
+    }
+    return { rowCount: rows.length, rows, fields: [] }
+  }
+
   const client: MockClient = {
     queries: [],
-    query: vi.fn(async (config: string | QueryConfig, values?: unknown[]) => {
-      const sql = typeof config === 'string' ? config : config.text
-      client.queries.push({ sql, values: typeof config === 'string' ? values : config.values })
-      if (sql === held?.sql) {
-        await held.until
-      }
-      if (sql.startsWith('BEGIN') && failures.begin > 0) {
-        failures.begin--
-        throw new Error('Connection terminated unexpectedly')
-      }
-      if (sql === failures.sql) {
-        throw new Error('relation "missing" does not exist')
-      }
-      // Statements run for storage workers use array row mode with raw text values.
-      if (typeof config !== 'string' && config.rowMode === 'array') {
-        return toRawResult(rows)
-      }
-      return { rowCount: rows.length, rows, fields: [] }
-    }),
+    query: vi.fn((config: string | QueryConfig | BatchQuery, values?: unknown[]) =>
+      typeof config === 'object' && 'submit' in config
+        ? runBatchQuery(config, run)
+        : run(config, values)
+    ),
     release: vi.fn(),
   }
 
   return client
+}
+
+type MockResult = {
+  rowCount: number
+  rows: unknown[]
+  fields: Array<{ name: string; dataTypeID: number }>
+}
+
+// Plays a BatchQuery the way PostgreSQL answers one: statement by statement, and nothing
+// after the first failure.
+async function runBatchQuery(batch: BatchQuery, run: (config: QueryConfig) => Promise<MockResult>) {
+  for (const statement of batch.statements) {
+    let result: MockResult
+    try {
+      result = await run({ text: statement.text, values: statement.values, rowMode: 'array' })
+    } catch (error) {
+      batch.handleError(error)
+      return batch
+    }
+    batch.handleRowDescription({ fields: result.fields as never })
+    for (const row of result.rows) {
+      batch.handleDataRow({ fields: row as Array<string | null> })
+    }
+    batch.handleCommandComplete({ text: `SELECT ${result.rowCount}` })
+  }
+  batch.handleReadyForQuery()
+  return batch
 }
 
 function toRawResult(rows: Record<string, unknown>[]) {
@@ -112,10 +158,6 @@ async function loadApp(
       setTypeParser: vi.fn(),
     }
 
-    class MockDatabaseError extends Error {
-      code?: string
-    }
-
     class MockPool {
       totalCount = 0
       idleCount = 0
@@ -155,6 +197,13 @@ async function loadApp(
 
   vi.doMock('pg/lib/connection', () => ({
     default: class MockPgConnection {},
+  }))
+
+  vi.doMock('@internal/database/postgres/cancellation', async (importOriginal) => ({
+    ...(await importOriginal<object>()),
+    cancelQuery: vi.fn(async (client: MockClient) => {
+      client.cancelRequested = true
+    }),
   }))
 
   // We need dynamic import due to the mocking of PostgreSQL modules above
@@ -777,7 +826,7 @@ describe('database Watt application messaging handlers', () => {
     expect(clients[0].release).toHaveBeenCalledWith()
   })
 
-  it('runs no further batch statement once cancelled, and closes the connection', async () => {
+  it('interrupts the running batch statement once cancelled, and closes the connection', async () => {
     const finish = deferred()
     const { clients, messaging } = await loadApp({
       heldStatement: { sql: 'SELECT 1', until: finish.promise },
@@ -795,8 +844,10 @@ describe('database Watt application messaging handlers', () => {
     })
     finish.resolve()
 
+    // PostgreSQL cancels SELECT 1 and skips the rest of the batch, COMMIT included.
     expect(await batch).toMatchObject({
-      code: 'CANCELLED',
+      code: 'POSTGRES_ERROR',
+      sqlState: '57014',
       requestId: 'req-1',
       connectionDiscarded: true,
     })
@@ -874,7 +925,7 @@ describe('database Watt application messaging handlers', () => {
     expect(clients[0].release).toHaveBeenCalledWith(undefined)
   })
 
-  it('runs no further statement of a cancelled locked batch', async () => {
+  it('interrupts the running statement of a cancelled locked batch', async () => {
     const finish = deferred()
     const { clients, messaging } = await loadApp({
       heldStatement: { sql: 'SELECT 1', until: finish.promise },
@@ -894,7 +945,12 @@ describe('database Watt application messaging handlers', () => {
     ).toEqual({ cancelled: true })
     finish.resolve()
 
-    expect(await batch).toMatchObject({ code: 'CANCELLED', requestId: 'req-1' })
+    // PostgreSQL cancels SELECT 1 and skips SELECT 2.
+    expect(await batch).toMatchObject({
+      code: 'POSTGRES_ERROR',
+      sqlState: '57014',
+      requestId: 'req-1',
+    })
     expect(await messaging.send('database', 'database.rollbackTransaction', { lockId })).toEqual({
       rolledBack: true,
     })

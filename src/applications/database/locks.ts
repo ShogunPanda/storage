@@ -122,9 +122,9 @@ export class LockRegistry {
   }
 
   /**
-   * Runs several statements on the locked connection, written at once when it pipelines.
-   * Like query(), `onStart` runs before the first one; once `signal` is aborted no further
-   * statement is sent.
+   * Runs several statements on the locked connection in one round trip (see runStatements).
+   * Like query(), `onStart` runs before the first one; once `signal` is aborted nothing is
+   * sent.
    */
   async batch(
     lockId: string,

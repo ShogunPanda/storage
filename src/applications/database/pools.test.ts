@@ -46,7 +46,8 @@ vi.mock('pg', () => ({
 }))
 
 import { getConfig } from '../../config.js'
-import { BeginError, PoolRegistry, runBatch } from './pools.js'
+import type { BatchQuery } from './batch-query.js'
+import { BeginError, PoolRegistry, runBatch, runStatements } from './pools.js'
 
 function destination(id: string, maxConnections = 10) {
   return { connectionString: `postgres://${id}`, id, isExternalPool: false, maxConnections }
@@ -208,94 +209,96 @@ describe('database pool registry', () => {
 })
 
 describe('runBatch', () => {
-  const raw = { rowCount: 1, rows: [['1']], fields: [{ name: 'n', dataTypeID: 23 }] }
+  type PlayedStatement = { text: string; reply: 'ok' | Error }
 
-  it('starts no statement, nor COMMIT, once the request is cancelled', async () => {
-    const controller = new AbortController()
-    const query = vi.fn(async (statement: string | { text: string }) => {
-      if (typeof statement !== 'string' && statement.text === 'SELECT 1') {
-        controller.abort()
-      }
-      return raw
+  // A client that answers a BatchQuery the way PostgreSQL does: in order, and nothing after
+  // the first failure. `replies` decides each statement's outcome by its text.
+  function client(replies: Record<string, Error> = {}) {
+    const played: PlayedStatement[] = []
+    const query = vi.fn((batch: BatchQuery) => {
+      queueMicrotask(() => {
+        for (const statement of batch.statements) {
+          const failure = replies[statement.text]
+          played.push({ text: statement.text, reply: failure ?? 'ok' })
+          if (failure) {
+            batch.handleError(failure)
+            return
+          }
+          batch.handleRowDescription({ fields: [{ name: 'n', dataTypeID: 23 }] as never })
+          batch.handleDataRow({ fields: ['1'] })
+          batch.handleCommandComplete({ text: 'SELECT 1' })
+        }
+        batch.handleReadyForQuery()
+      })
+      return batch
     })
-
-    await expect(
-      runBatch(
-        { query } as never,
-        'BEGIN',
-        [{ sql: 'SELECT 1' }, { sql: 'SELECT 2' }],
-        'COMMIT',
-        controller.signal
-      )
-    ).rejects.toMatchObject({ code: 'CANCELLED' })
-
-    expect(
-      query.mock.calls.map(([statement]) => (statement as { text?: string }).text ?? statement)
-    ).toEqual(['BEGIN', 'SELECT 1'])
-  })
-})
-
-describe('runBatch on a pipelining client', () => {
-  function pipeliningClient(query: ReturnType<typeof vi.fn>) {
-    const stream = { cork: vi.fn(), uncork: vi.fn() }
-    return { client: { pipeline: true, query, connection: { stream } } as never, stream }
+    return { client: { query } as never, query, played }
   }
 
-  const raw = { rowCount: 1, rows: [['1']], fields: [{ name: 'n', dataTypeID: 23 }] }
+  const row = {
+    command: 'SELECT',
+    rowCount: 1,
+    rows: [['1']],
+    fields: [{ name: 'n', dataTypeID: 23 }],
+  }
 
-  it('sends nothing after a failed BEGIN', async () => {
-    const query = vi.fn().mockRejectedValueOnce(new Error('pooler refused BEGIN'))
-    const { client } = pipeliningClient(query)
-
-    await expect(
-      runBatch(
-        client,
-        'BEGIN',
-        [{ sql: 'SELECT set_config($1, $2, true)' }, { sql: 'INSERT 1' }],
-        'COMMIT'
-      )
-    ).rejects.toBeInstanceOf(BeginError)
-
-    // Statements sent behind a failed BEGIN would run in autocommit, without the scope.
-    expect(query).toHaveBeenCalledTimes(1)
-    expect(query).toHaveBeenCalledWith('BEGIN')
-  })
-
-  it('sends nothing after BEGIN when the request was cancelled during it', async () => {
-    const controller = new AbortController()
-    const query = vi.fn(async () => {
-      controller.abort()
-      return raw
-    })
-    const { client, stream } = pipeliningClient(query)
-
-    await expect(
-      runBatch(client, 'BEGIN', [{ sql: 'SELECT 1' }], 'COMMIT', controller.signal)
-    ).rejects.toMatchObject({ code: 'CANCELLED' })
-
-    expect(query).toHaveBeenCalledTimes(1)
-    expect(stream.cork).not.toHaveBeenCalled()
-  })
-
-  it('writes the statements and COMMIT together once BEGIN succeeds', async () => {
-    const query = vi.fn().mockResolvedValue(raw)
-    const { client, stream } = pipeliningClient(query)
+  it('sends BEGIN, the statements and COMMIT as one query', async () => {
+    const { client: pgClient, query } = client()
 
     const results = await runBatch(
-      client,
+      pgClient,
       'BEGIN',
-      [{ sql: 'SELECT 1' }, { sql: 'SELECT 2' }],
+      [{ sql: 'SELECT 1', values: [1] }, { sql: 'SELECT 2' }],
       'COMMIT'
     )
 
-    expect(results).toEqual([raw, raw])
-    expect(query.mock.calls.map(([statement]) => statement.text ?? statement)).toEqual([
-      'BEGIN',
-      'SELECT 1',
-      'SELECT 2',
-      'COMMIT',
+    expect(query).toHaveBeenCalledTimes(1)
+    expect(query.mock.calls[0][0].statements).toEqual([
+      { text: 'BEGIN' },
+      { text: 'SELECT 1', values: [1] },
+      { text: 'SELECT 2', values: undefined },
+      { text: 'COMMIT' },
     ])
-    expect(stream.cork).toHaveBeenCalledTimes(1)
-    expect(stream.uncork).toHaveBeenCalledTimes(1)
+    // Only the statements' results: not BEGIN's, nor COMMIT's.
+    expect(results).toMatchObject([row, row])
+  })
+
+  it('throws a BeginError when BEGIN fails, and nothing behind it runs', async () => {
+    const refused = new Error('no more connections allowed')
+    const { client: pgClient, played } = client({ BEGIN: refused })
+
+    const failure = runBatch(pgClient, 'BEGIN', [{ sql: 'INSERT 1' }], 'COMMIT')
+
+    await expect(failure).rejects.toBeInstanceOf(BeginError)
+    await expect(failure).rejects.toMatchObject({ original: refused })
+    expect(played).toEqual([{ text: 'BEGIN', reply: refused }])
+  })
+
+  it('throws the statement error itself once BEGIN has run', async () => {
+    const missing = new Error('relation "missing" does not exist')
+    const { client: pgClient, played } = client({ 'SELECT missing': missing })
+
+    await expect(
+      runBatch(pgClient, 'BEGIN', [{ sql: 'SELECT missing' }, { sql: 'SELECT 2' }], 'COMMIT')
+    ).rejects.toBe(missing)
+    expect(played.map((statement) => statement.text)).toEqual(['BEGIN', 'SELECT missing'])
+  })
+
+  it('throws statement errors as they are without BEGIN (a locked batch)', async () => {
+    const missing = new Error('relation "missing" does not exist')
+    const { client: pgClient } = client({ 'SELECT missing': missing })
+
+    await expect(runStatements(pgClient, [{ sql: 'SELECT missing' }])).rejects.toBe(missing)
+  })
+
+  it('sends nothing once the request is cancelled', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const { client: pgClient, query } = client()
+
+    await expect(
+      runBatch(pgClient, 'BEGIN', [{ sql: 'SELECT 1' }], 'COMMIT', controller.signal)
+    ).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(query).not.toHaveBeenCalled()
   })
 })

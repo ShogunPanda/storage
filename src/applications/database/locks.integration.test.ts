@@ -4,13 +4,9 @@ import { getConfig } from '../../config.js'
 import { LockRegistry } from './locks.js'
 import type { DatabasePoolTarget } from './protocol.js'
 
-// COMMIT with deferred statements, against a real server: on a pipelining connection COMMIT
-// is written behind them and PostgreSQL turns it into a ROLLBACK after a failure; otherwise
-// the statements run first and COMMIT is never sent.
-describe.each([
-  ['a pipelining', true],
-  ['a regular', false],
-])('LockRegistry commit on %s connection', (_, pipeline) => {
+// COMMIT with deferred statements, against a real server: they are written with COMMIT and
+// end with one Sync, so after a failure PostgreSQL skips the rest, COMMIT included.
+describe('LockRegistry commit with deferred statements', () => {
   const table = 'database_watt_lock_commit_check'
   const config = getConfig()
   const destination: DatabasePoolTarget = {
@@ -36,7 +32,7 @@ describe.each([
   }
 
   beforeAll(async () => {
-    pool = new Pool({ connectionString: config.databaseURL, max: 2, pipeline })
+    pool = new Pool({ connectionString: config.databaseURL, max: 2 })
     await pool.query(`CREATE TABLE IF NOT EXISTS ${table} (n int)`)
     registry = new LockRegistry(config)
   })
