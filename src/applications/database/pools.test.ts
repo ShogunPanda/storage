@@ -224,7 +224,7 @@ describe('runBatch', () => {
         { query } as never,
         'BEGIN',
         [{ sql: 'SELECT 1' }, { sql: 'SELECT 2' }],
-        true,
+        'COMMIT',
         controller.signal
       )
     ).rejects.toMatchObject({ code: 'CANCELLED' })
@@ -252,7 +252,7 @@ describe('runBatch on a pipelining client', () => {
         client,
         'BEGIN',
         [{ sql: 'SELECT set_config($1, $2, true)' }, { sql: 'INSERT 1' }],
-        true
+        'COMMIT'
       )
     ).rejects.toBeInstanceOf(BeginError)
 
@@ -270,7 +270,7 @@ describe('runBatch on a pipelining client', () => {
     const { client, stream } = pipeliningClient(query)
 
     await expect(
-      runBatch(client, 'BEGIN', [{ sql: 'SELECT 1' }], true, controller.signal)
+      runBatch(client, 'BEGIN', [{ sql: 'SELECT 1' }], 'COMMIT', controller.signal)
     ).rejects.toMatchObject({ code: 'CANCELLED' })
 
     expect(query).toHaveBeenCalledTimes(1)
@@ -285,7 +285,7 @@ describe('runBatch on a pipelining client', () => {
       client,
       'BEGIN',
       [{ sql: 'SELECT 1' }, { sql: 'SELECT 2' }],
-      true
+      'COMMIT'
     )
 
     expect(results).toEqual([raw, raw])

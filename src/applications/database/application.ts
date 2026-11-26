@@ -34,6 +34,7 @@ import {
   type CommitTransactionRequest,
   DATABASE_MESSAGES,
   type DatabasePoolTarget,
+  type LockedBatchRequest,
   type LockedQueryRequest,
   type QueryRequest,
   type ReleaseConnectionRequest,
@@ -43,6 +44,8 @@ import {
   validateBatchEnvelope,
   validateBeginTransactionEnvelope,
   validateCancelRequest,
+  validateCommitEnvelope,
+  validateLockedBatchEnvelope,
   validateLockRequestEnvelope,
   validateNonLockRequestEnvelope,
   validateQueryEnvelope,
@@ -84,6 +87,7 @@ export class Application {
       beginTransaction: 0,
       cancel: 0,
       commitTransaction: 0,
+      lockedBatch: 0,
       lockedQuery: 0,
       query: 0,
       release: 0,
@@ -116,6 +120,7 @@ export class Application {
     messaging.handle(DATABASE_MESSAGES.query, this.#handleQuery.bind(this), plainData)
     messaging.handle(DATABASE_MESSAGES.acquire, this.#handleAcquire.bind(this), plainData)
     messaging.handle(DATABASE_MESSAGES.batch, this.#handleBatch.bind(this), plainData)
+    messaging.handle(DATABASE_MESSAGES.lockedBatch, this.#handleLockedBatch.bind(this), plainData)
     messaging.handle(DATABASE_MESSAGES.lockedQuery, this.#handleLockedQuery.bind(this), plainData)
     messaging.handle(DATABASE_MESSAGES.release, this.#handleRelease.bind(this), plainData)
     messaging.handle(
@@ -214,6 +219,41 @@ export class Application {
       if (request && !this.#locks.has(request.lockId)) {
         // The lock was dropped (broken connection or expiry): tell the caller its
         // transaction is gone so it does not try to commit or roll it back.
+        response.connectionDiscarded = true
+      }
+      return response
+    } finally {
+      this.#cancellations.finish(cancellationRequestId)
+    }
+  }
+
+  async #handleLockedBatch(rawRequest: unknown, context?: MessageContext): Promise<unknown> {
+    this.#stats.lockedBatch++
+    let request: LockedBatchRequest | undefined
+    let destination: string | undefined
+    let cancellationRequestId: string | undefined
+
+    try {
+      validateLockedBatchEnvelope(rawRequest)
+      request = rawRequest as LockedBatchRequest
+      destination = this.#locks.getDestination(request.lockId)
+
+      this.#assertAcceptingWork()
+      const operation = this.#cancellations.start(request.requestId, request.lockId)
+      cancellationRequestId = request.requestId
+
+      // As for a locked query: until the batch starts, a cancel only stops it from starting.
+      const results = await this.#locks.batch(
+        request.lockId,
+        request.statements,
+        getOwner(context),
+        (client) => operation.runOn(client),
+        operation.signal
+      )
+      return toBatchResponse(request.statements, results)
+    } catch (error) {
+      const response = toErrorResponse(error, request ? { ...request, destination } : undefined)
+      if (request && !this.#locks.has(request.lockId)) {
         response.connectionDiscarded = true
       }
       return response
@@ -323,11 +363,11 @@ export class Application {
     let destination: string | undefined
 
     try {
-      validateLockRequestEnvelope(rawRequest)
+      validateCommitEnvelope(rawRequest)
       request = rawRequest as CommitTransactionRequest
       destination = this.#locks.getDestination(request.lockId)
 
-      await this.#locks.commit(request.lockId, getOwner(context))
+      await this.#locks.commit(request.lockId, getOwner(context), request.statements)
       return { committed: true }
     } catch (error) {
       return toErrorResponse(error, request ? { ...request, destination } : undefined)
@@ -377,7 +417,7 @@ export class Application {
       this.#assertAcceptingWork()
       this.#assertOwns(request.destination)
       // A transaction left open is owned by the caller's channel.
-      const owner = request.commit ? undefined : this.#trackOwner(context)
+      const owner = request.commit || request.rollback ? undefined : this.#trackOwner(context)
       const operation = this.#cancellations.start(request.requestId)
       cancellationRequestId = request.requestId
 
@@ -431,11 +471,12 @@ export class Application {
       }
 
       try {
+        const end = request.commit ? 'COMMIT' : request.rollback ? 'ROLLBACK' : undefined
         const results = await runBatch(
           client,
           beginStatement,
           request.statements,
-          request.commit,
+          end,
           operation.signal
         )
         return { client, results }

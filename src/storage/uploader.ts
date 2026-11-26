@@ -88,23 +88,27 @@ export class Uploader {
   ) {}
 
   async authorizeUpload(db: Database, options: CanUploadOptions) {
-    await db.testPermission((permissionDb) => {
-      const object = {
-        bucket_id: options.bucketId,
-        name: options.objectName,
-        // A shared version can deadlock concurrent create/upsert probes on the version index.
-        version: randomUUID(),
-        owner: options.owner,
-        metadata: options.metadata,
-        user_metadata: options.userMetadata,
-      }
+    // Either probe is a single INSERT, so the whole check can be one round trip.
+    await db.testPermission(
+      (permissionDb) => {
+        const object = {
+          bucket_id: options.bucketId,
+          name: options.objectName,
+          // A shared version can deadlock concurrent create/upsert probes on the version index.
+          version: randomUUID(),
+          owner: options.owner,
+          metadata: options.metadata,
+          user_metadata: options.userMetadata,
+        }
 
-      // The upsert probe is status independent; a plain INSERT keeps reporting
-      // KeyAlreadyExists for non-upsert uploads over a live object.
-      return !options.isUpsert && !options.currentObjectIsDeleteMarker
-        ? permissionDb.createObject(object)
-        : permissionDb.upsertObject(object, { currentVersion: true })
-    })
+        // The upsert probe is status independent; a plain INSERT keeps reporting
+        // KeyAlreadyExists for non-upsert uploads over a live object.
+        return !options.isUpsert && !options.currentObjectIsDeleteMarker
+          ? permissionDb.createObject(object)
+          : permissionDb.upsertObject(object, { currentVersion: true })
+      },
+      { singleStatement: true }
+    )
   }
 
   async canUpload(options: CanUploadOptions) {
@@ -244,24 +248,15 @@ export class Uploader {
       // shares its locks and rolls back only its savepoint, since the row and
       // metadata may have changed after the pre-upload authorization.
       const written = await this.db.asSuperUser().withTransaction(async (db) => {
-        await db.waitObjectLock(bucketId, objectName, undefined, {
-          timeout: 5000,
-        })
-
-        // Lock order shared by every writer: advisory key lock, then the
-        // bucket's shared status lock, then row locks.
-        const versioningStatus = hasVersioning
-          ? ((await db.findBucketById(bucketId, 'versioning_status', { forShare: true }))
-              .versioning_status ?? 'DISABLED')
-          : 'DISABLED'
-
-        const currentObj = await db.findObject(
+        // The advisory key lock, then the bucket's shared status lock, then the row lock:
+        // the lock order every writer shares.
+        const { versioningStatus, object: currentObj } = await db.lockObjectForWrite(
           bucketId,
           objectName,
-          'id, version, metadata, is_delete_marker, is_versioned',
           {
-            forUpdate: true,
-            dontErrorOnEmpty: true,
+            lockTimeout: 5000,
+            objectColumns: 'id, version, metadata, is_delete_marker, is_versioned',
+            versioning: hasVersioning,
           }
         )
 

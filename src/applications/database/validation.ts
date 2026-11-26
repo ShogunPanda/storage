@@ -61,8 +61,41 @@ export function validateBeginTransactionEnvelope(request: unknown): void {
 
 export function validateBatchEnvelope(request: unknown): void {
   validateBeginTransactionEnvelope(request)
-  const { statements, commit } = request as { statements?: unknown; commit?: unknown }
+  const { statements, commit, rollback } = request as {
+    statements?: unknown
+    commit?: unknown
+    rollback?: unknown
+  }
 
+  validateStatements(statements)
+
+  if (typeof commit !== 'boolean') {
+    throw new DatabaseWattError('PROTOCOL_ERROR', 'commit must be a boolean')
+  }
+
+  if (rollback !== undefined && typeof rollback !== 'boolean') {
+    throw new DatabaseWattError('PROTOCOL_ERROR', 'rollback must be a boolean when present')
+  }
+
+  if (commit && rollback) {
+    throw new DatabaseWattError('PROTOCOL_ERROR', 'A batch cannot both commit and roll back')
+  }
+}
+
+export function validateLockedBatchEnvelope(request: unknown): void {
+  validateLockRequestEnvelope(request)
+  validateStatements((request as { statements?: unknown }).statements)
+}
+
+export function validateCommitEnvelope(request: unknown): void {
+  validateLockRequestEnvelope(request)
+  const statements = (request as { statements?: unknown }).statements
+  if (statements !== undefined) {
+    validateStatements(statements)
+  }
+}
+
+function validateStatements(statements: unknown): void {
   if (!Array.isArray(statements) || statements.length === 0) {
     throw new DatabaseWattError('PROTOCOL_ERROR', 'statements must be a non-empty array')
   }
@@ -76,10 +109,6 @@ export function validateBatchEnvelope(request: unknown): void {
     if (result !== undefined && typeof result !== 'boolean') {
       throw new DatabaseWattError('PROTOCOL_ERROR', 'result must be a boolean when present')
     }
-  }
-
-  if (typeof commit !== 'boolean') {
-    throw new DatabaseWattError('PROTOCOL_ERROR', 'commit must be a boolean')
   }
 }
 

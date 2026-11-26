@@ -625,6 +625,99 @@ describe('database Watt application messaging handlers', () => {
     expect(clients[0].release).toHaveBeenCalledWith(undefined)
   })
 
+  it('rolls back a probe batch and releases its connection', async () => {
+    const { clients, messaging } = await loadApp()
+
+    const response = await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT set_config($1, $2, true)' }, { sql: 'INSERT INTO t VALUES (1)' }],
+      commit: false,
+      rollback: true,
+    })
+
+    expect(response).toEqual(okResponse)
+    expect(clients[0].queries.map((query) => query.sql)).toEqual([
+      'BEGIN',
+      'SELECT set_config($1, $2, true)',
+      'INSERT INTO t VALUES (1)',
+      'ROLLBACK',
+    ])
+    expect(clients[0].release).toHaveBeenCalledTimes(1)
+    expect(clients[0].release.mock.calls[0][0]).toBeUndefined()
+  })
+
+  it('rejects a batch that asks to both commit and roll back', async () => {
+    const { clients, messaging } = await loadApp()
+
+    const response = await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT 1' }],
+      commit: true,
+      rollback: true,
+    })
+
+    expect(response).toMatchObject({ code: 'PROTOCOL_ERROR' })
+    expect(clients).toHaveLength(0)
+  })
+
+  it('runs several statements on a pinned connection with one message', async () => {
+    const { clients, messaging } = await loadApp()
+
+    const batch = (await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT 1' }],
+      commit: false,
+    })) as typeof okResponse & { lockId: string }
+    const response = await messaging.send('database', 'database.lockedBatch', {
+      lockId: batch.lockId,
+      statements: [{ sql: 'SAVEPOINT a' }, { sql: 'SELECT 2', result: true }, { sql: 'SELECT 3' }],
+    })
+    const commit = await messaging.send('database', 'database.commitTransaction', {
+      lockId: batch.lockId,
+      statements: [{ sql: 'RELEASE SAVEPOINT a' }],
+    })
+
+    expect(response).toEqual({ ...okResponse, results: [okResponse] })
+    expect(commit).toEqual({ committed: true })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual([
+      'BEGIN',
+      'SELECT 1',
+      'SAVEPOINT a',
+      'SELECT 2',
+      'SELECT 3',
+      'RELEASE SAVEPOINT a',
+      'COMMIT',
+    ])
+    expect(clients[0].release).toHaveBeenCalledWith(undefined)
+  })
+
+  it('keeps the transaction of a failed locked batch for the caller to roll back', async () => {
+    const { clients, messaging } = await loadApp({ failingSql: 'SELECT broken' })
+
+    const batch = (await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT 1' }],
+      commit: false,
+    })) as typeof okResponse & { lockId: string }
+    const response = (await messaging.send('database', 'database.lockedBatch', {
+      lockId: batch.lockId,
+      statements: [{ sql: 'SELECT broken' }, { sql: 'SELECT 2' }],
+    })) as DatabaseErrorResponse
+    const rollback = await messaging.send('database', 'database.rollbackTransaction', {
+      lockId: batch.lockId,
+    })
+
+    expect(response).toMatchObject({ message: 'relation "missing" does not exist' })
+    expect(response.connectionDiscarded).toBeUndefined()
+    expect(rollback).toEqual({ rolledBack: true })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual([
+      'BEGIN',
+      'SELECT 1',
+      'SELECT broken',
+      'ROLLBACK',
+    ])
+  })
+
   it('retries BEGIN of a batch on a broken pooled connection', async () => {
     const { clients, messaging } = await loadApp({ beginFailures: 1 })
 
@@ -745,6 +838,69 @@ describe('database Watt application messaging handlers', () => {
     expect(clients[0].queries.map((query) => query.sql)).toEqual(['BEGIN', 'SELECT 1', 'COMMIT'])
     // No cancel reached the backend, so the connection goes back to the pool.
     expect(clients[0].release).toHaveBeenCalledWith(undefined)
+  })
+
+  it('cancels a queued locked batch without touching the running statement', async () => {
+    const finish = deferred()
+    const { clients, messaging } = await loadApp({
+      heldStatement: { sql: 'SELECT 1', until: finish.promise },
+    })
+    const { lockId } = (await messaging.send('database', 'database.beginTransaction', {
+      destination: createDestination(),
+    })) as { lockId: string }
+
+    const running = messaging.send('database', 'database.lockedQuery', {
+      lockId,
+      requestId: 'req-a',
+      sql: 'SELECT 1',
+    })
+    const queued = messaging.send('database', 'database.lockedBatch', {
+      lockId,
+      requestId: 'req-b',
+      statements: [{ sql: 'SELECT 2' }, { sql: 'SELECT 3' }],
+    })
+    await nextTurn()
+    expect(
+      await messaging.send('database', 'database.cancel', { requestId: 'req-b', lockId })
+    ).toEqual({ cancelled: true })
+    finish.resolve()
+
+    expect(await running).toEqual(okResponse)
+    expect(await queued).toMatchObject({ code: 'CANCELLED', requestId: 'req-b' })
+    expect(await messaging.send('database', 'database.commitTransaction', { lockId })).toEqual({
+      committed: true,
+    })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual(['BEGIN', 'SELECT 1', 'COMMIT'])
+    expect(clients[0].release).toHaveBeenCalledWith(undefined)
+  })
+
+  it('runs no further statement of a cancelled locked batch', async () => {
+    const finish = deferred()
+    const { clients, messaging } = await loadApp({
+      heldStatement: { sql: 'SELECT 1', until: finish.promise },
+    })
+    const { lockId } = (await messaging.send('database', 'database.beginTransaction', {
+      destination: createDestination(),
+    })) as { lockId: string }
+
+    const batch = messaging.send('database', 'database.lockedBatch', {
+      lockId,
+      requestId: 'req-1',
+      statements: [{ sql: 'SELECT 1' }, { sql: 'SELECT 2' }],
+    })
+    await nextTurn()
+    expect(
+      await messaging.send('database', 'database.cancel', { requestId: 'req-1', lockId })
+    ).toEqual({ cancelled: true })
+    finish.resolve()
+
+    expect(await batch).toMatchObject({ code: 'CANCELLED', requestId: 'req-1' })
+    expect(await messaging.send('database', 'database.rollbackTransaction', { lockId })).toEqual({
+      rolledBack: true,
+    })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual(['BEGIN', 'SELECT 1', 'ROLLBACK'])
+    // A cancel was sent on this backend: it is closed rather than reused.
+    expect(clients[0].release).toHaveBeenCalledWith(expect.any(Error))
   })
 
   it('closes pools and rejects new work after shutdown starts', async () => {

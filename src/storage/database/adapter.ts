@@ -145,6 +145,19 @@ export interface BucketAndObject {
   object?: Obj
 }
 
+export interface ObjectForWriteOptions {
+  /** How long to wait for the object's advisory lock, in milliseconds. */
+  lockTimeout: number
+  objectColumns: string
+  /** Whether the tenant has the versioning schema, so the bucket's status must be read. */
+  versioning: boolean
+}
+
+export interface ObjectForWrite {
+  versioningStatus: BucketVersioningStatus
+  object?: Obj
+}
+
 export interface DatabaseOptions<TNX> {
   tenantId: string
   reqId?: string
@@ -195,7 +208,15 @@ export interface Database {
     transactionOptions?: TransactionOptions
   ): Promise<T>
 
-  testPermission<T>(fn: (db: Database) => T | Promise<T>): Promise<Awaited<T>>
+  /**
+   * Runs `fn` in a transaction that is always rolled back. Pass `singleStatement` when `fn`
+   * runs exactly one statement: where the connection allows it, the whole probe is then
+   * one round trip.
+   */
+  testPermission<T>(
+    fn: (db: Database) => T | Promise<T>,
+    options?: { singleStatement?: boolean }
+  ): Promise<Awaited<T>>
 
   createBucket(
     data: Pick<
@@ -334,6 +355,17 @@ export interface Database {
     version?: string,
     opts?: { timeout?: number }
   ): Promise<boolean>
+
+  /**
+   * What a write needs before it changes an object: waits for the object's advisory lock,
+   * then reads the bucket's versioning status FOR SHARE (with versioning) and the object FOR
+   * UPDATE, in that order. Where the transaction allows it, all three cost one round trip.
+   */
+  lockObjectForWrite(
+    bucketId: string,
+    objectName: string,
+    options: ObjectForWriteOptions
+  ): Promise<ObjectForWrite>
 
   /**
    * Acquires every advisory lock in one round trip, in a deterministic order.
