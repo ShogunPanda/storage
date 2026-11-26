@@ -11,6 +11,7 @@ import {
 } from '../../internal/database/watt/client.js'
 import { getWattPostgresConnection } from '../../internal/database/watt/connection.js'
 import { StoragePgDB } from '../../storage/database/pg.js'
+import { Uploader } from '../../storage/uploader.js'
 import type { DatabaseErrorResponse, DatabasePoolTarget } from './protocol.js'
 
 type ApplicationContext = {
@@ -685,6 +686,35 @@ describe('Database Watt application loopback integration', () => {
       expect(probed).toMatchObject({ name: 'a.txt' })
       expect(stats).toMatchObject({ batch: 1, lockedQuery: 0, rollbackTransaction: 0 })
       expect(await objectCount('a.txt')).toBe(0)
+    })
+
+    // Each branch of the upload probe has to be one statement, or it costs a regular
+    // transaction (see testPermission).
+    it.each([
+      ['a new object', { isUpsert: false }],
+      ['an upsert', { isUpsert: true }],
+      ['an upload over a delete marker', { isUpsert: false, currentObjectIsDeleteMarker: true }],
+    ])('authorizes %s with one message that rolls back', async (_, kind) => {
+      const db = await storageFor('service_role')
+      const uploader = new Uploader(undefined as never, db, undefined as never)
+
+      await uploader.authorizeUpload(db, {
+        bucketId: bucketName,
+        objectName: 'd.txt',
+        owner: undefined,
+        metadata: {},
+        userMetadata: undefined,
+        ...kind,
+      })
+
+      expect(await getDatabaseWattStats()).toMatchObject({
+        batch: 1,
+        beginTransaction: 0,
+        lockedBatch: 0,
+        lockedQuery: 0,
+        rollbackTransaction: 0,
+      })
+      expect(await objectCount('d.txt')).toBe(0)
     })
 
     it('answers a denied single-statement probe with the policy error', async () => {

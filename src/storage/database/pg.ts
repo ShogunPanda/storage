@@ -60,7 +60,6 @@ import {
   FindBucketFilters,
   FindObjectFilters,
   ListBucketOptions,
-  lockObjectForWriteInTurn,
   ObjectForWrite,
   ObjectForWriteOptions,
   ObjectLockKey,
@@ -464,17 +463,25 @@ export class StoragePgDB implements Database {
         ? this.connection.rollbackStatementExecutor?.()
         : undefined
     if (probe) {
+      const tnx = new SingleStatementTransaction(probe)
       try {
-        return await fn(
+        const result = await fn(
           new StoragePgDB(this.connection, {
             ...this.options,
-            tnx: new SingleStatementTransaction(probe),
+            tnx,
             scope: { applied: this.connection },
           })
         )
+        if (!tnx.overrun) {
+          return result
+        }
       } catch (e) {
-        throw mapPgError(e)
+        if (!tnx.overrun) {
+          throw mapPgError(e)
+        }
       }
+      // `fn` ran more than one statement, so its answer is not the probe's: its first
+      // statement was rolled back on its own. Probe again in a regular transaction.
     }
 
     let result: Awaited<T>
@@ -2521,7 +2528,8 @@ export class StoragePgDB implements Database {
     try {
       results = await tnx.queryBatch(statements, { signal: abortSignal })
     } catch (e) {
-      // The lock comes first: a lock timeout can only be its failure.
+      // The lock runs first, so a lock timeout is almost always its own (the reads can only
+      // hit one under a lock_timeout set on the role or the database).
       if (isPgLockTimeoutError(e)) {
         throw ERRORS.LockTimeout(e)
       }
@@ -4185,10 +4193,39 @@ function objectLockStatement(hash: number, lockTimeoutMs: number): DatabaseState
 }
 
 /**
+ * Database.lockObjectForWrite as three steps, for transactions that cannot batch them:
+ * waitObjectLock, then findBucketById FOR SHARE (with versioning) and findObject FOR UPDATE.
+ */
+export async function lockObjectForWriteInTurn(
+  db: Pick<Database, 'waitObjectLock' | 'findBucketById' | 'findObject'>,
+  bucketId: string,
+  objectName: string,
+  options: ObjectForWriteOptions
+): Promise<ObjectForWrite> {
+  await db.waitObjectLock(bucketId, objectName, undefined, { timeout: options.lockTimeout })
+
+  // Lock order shared by every writer: advisory key lock, then the bucket's shared status
+  // lock, then row locks.
+  const versioningStatus = options.versioning
+    ? ((await db.findBucketById(bucketId, 'versioning_status', { forShare: true }))
+        .versioning_status ?? 'DISABLED')
+    : 'DISABLED'
+
+  const object = await db.findObject(bucketId, objectName, options.objectColumns, {
+    forUpdate: true,
+    dontErrorOnEmpty: true,
+  })
+
+  return { versioningStatus, object }
+}
+
+/**
  * The transaction of a single statement executor: its one statement is the whole
- * transaction, so there is nothing left to commit or roll back.
+ * transaction, so there is nothing left to commit or roll back. A second statement fails
+ * and sets `overrun`, which the caller checks even if that failure was caught.
  */
 class SingleStatementTransaction implements DatabaseTransaction {
+  overrun = false
   private used = false
 
   constructor(private readonly executor: DatabaseExecutor) {}
@@ -4197,10 +4234,14 @@ class SingleStatementTransaction implements DatabaseTransaction {
     return this.used
   }
 
-  query<T extends QueryResultRow = QueryResultRow>(
+  async query<T extends QueryResultRow = QueryResultRow>(
     statement: string | DatabaseStatement,
     options?: Parameters<DatabaseExecutor['query']>[1]
   ): Promise<QueryResult<T>> {
+    if (this.used) {
+      this.overrun = true
+      throw new Error('A single statement transaction runs only one statement')
+    }
     this.used = true
     return this.executor.query<T>(statement, options)
   }
@@ -4337,6 +4378,15 @@ function nextSavepointName(): string {
 
 // Savepoint commands return nothing anyone reads: on transactions that defer such statements
 // (Database Watt) they travel with the next query or with COMMIT instead of on their own.
+//
+// A deferred command cannot fail on the spot: its failure is reported by the query (or
+// COMMIT) it travels with. On Database Watt a 25P02 from SAVEPOINT therefore goes through
+// that query's error mapping rather than mapPgTransactionAbortedError (DBError maps it to
+// DatabaseTransactionAborted too), and the "Failed to rollback savepoint" and "Failed to
+// restore parent transaction scope" warnings never fire, because ROLLBACK TO and the scope
+// statement are deferred as well: scope.applied is reset to scopeAtEntry as if the rollback
+// had succeeded. Failing the next statement is the safer outcome: the transaction is then
+// aborted, so nothing runs under the scope the rollback or the restore was meant to undo.
 async function createSavepoint(tnx: DatabaseTransaction, savepoint: string): Promise<void> {
   const query = `SAVEPOINT ${savepoint}`
 

@@ -218,6 +218,94 @@ describe('Watt PostgreSQL connection adapter', () => {
     expect(sent[3].data).not.toHaveProperty('statements')
   })
 
+  it('keeps deferred statements queued when a query is aborted before it is sent', async () => {
+    const { sent } = installWattMessagingMock({
+      'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
+      'database.lockedBatch': { rowCount: 0, rows: [] },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+    const aborted = new AbortController()
+    aborted.abort()
+
+    const tx = await connection.transaction()
+    await tx.query('SELECT 0')
+    tx.defer?.({ text: 'SAVEPOINT a' })
+    await expect(tx.query('SELECT 1', { signal: aborted.signal })).rejects.toMatchObject({
+      name: 'AbortError',
+    })
+    await tx.query('SELECT 2')
+
+    expect(sent.map((message) => message.message)).toEqual([
+      'database.batch',
+      'database.lockedBatch',
+    ])
+    expect(sent[1].data.statements).toEqual([
+      { sql: 'SAVEPOINT a', values: undefined },
+      { sql: 'SELECT 2', values: undefined },
+    ])
+  })
+
+  it('only rolls back a transaction whose deferred statements went with an aborted query', async () => {
+    const lockedBatch = Promise.withResolvers<unknown>()
+    const { sent } = installWattMessagingMock({
+      'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
+      'database.lockedBatch': lockedBatch.promise,
+      'database.cancel': { cancelled: true },
+      'database.rollbackTransaction': { rolledBack: true },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+    const controller = new AbortController()
+
+    const tx = await connection.transaction()
+    await tx.query('SELECT 0')
+    tx.defer?.({ text: 'SAVEPOINT a' })
+    const query = tx.query('SELECT 1', { signal: controller.signal })
+    controller.abort()
+    await expect(query).rejects.toMatchObject({ name: 'AbortError' })
+    lockedBatch.resolve({ rowCount: 0, rows: [] })
+
+    // The Database application may or may not have run SAVEPOINT a.
+    await expect(tx.query('SELECT 2')).rejects.toThrow('deferred statements may not have run')
+    await expect(tx.commit()).rejects.toThrow('deferred statements may not have run')
+    await tx.rollback()
+
+    expect(sent.map((message) => message.message)).toEqual([
+      'database.batch',
+      'database.lockedBatch',
+      'database.cancel',
+      'database.rollbackTransaction',
+    ])
+  })
+
+  it('drops deferred statements that went with a query PostgreSQL failed', async () => {
+    installWattMessagingMock({
+      'database.batch': { lockId: 'lock-a', rowCount: 0, rows: [] },
+      'database.lockedBatch': {
+        code: 'POSTGRES_ERROR',
+        message: 'new row violates row-level security policy',
+        sqlState: '42501',
+      },
+    })
+    const connection = await getWattPostgresConnection(createConnectionOptions())
+
+    const tx = await connection.transaction()
+    await tx.query('SELECT 0')
+    tx.defer?.({ text: 'SAVEPOINT a' })
+    await expect(tx.query('INSERT 1')).rejects.toMatchObject({ code: '42501' })
+
+    // SAVEPOINT a ran before the INSERT failed: the next query goes without it.
+    const { sent } = installWattMessagingMock({
+      'database.lockedBatch': { rowCount: 0, rows: [] },
+    })
+    tx.defer?.({ text: 'ROLLBACK TO SAVEPOINT a' })
+    await tx.query('SELECT 2')
+
+    expect(sent[0].data.statements).toEqual([
+      { sql: 'ROLLBACK TO SAVEPOINT a', values: undefined },
+      { sql: 'SELECT 2', values: undefined },
+    ])
+  })
+
   it('runs a batch of queries in the message that opens the transaction', async () => {
     const { sent } = installWattMessagingMock({
       'database.batch': {

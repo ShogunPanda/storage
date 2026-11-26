@@ -67,6 +67,10 @@ interface WattTransactionStart {
  */
 class WattPgTransaction implements DatabaseTransaction {
   private wattCompleted = false
+  // Set when deferred statements went out with a request that failed without PostgreSQL
+  // reporting why (aborted while in flight, lost in transit, refused): whether they ran is
+  // unknown, so the transaction can only be rolled back.
+  private deferredOutcomeUnknown = false
   private pendingStatementTimeoutMs?: number
   private pendingSearchPath?: string
   private lockId?: string
@@ -107,6 +111,8 @@ class WattPgTransaction implements DatabaseTransaction {
 
   // Queues a statement whose result nobody reads to run before the next query, or before
   // COMMIT, in the same message. ROLLBACK drops it. An error it raises is the next query's.
+  // It is kept in the Database application's wire format: BatchStatement ({ sql, values })
+  // where the storage side's DatabaseStatement has { text, values }.
   defer(statement: DatabaseStatement): void {
     this.deferredStatements.push({ sql: statement.text, values: statement.values })
   }
@@ -145,6 +151,7 @@ class WattPgTransaction implements DatabaseTransaction {
       return
     }
 
+    this.assertDeferredOutcomeKnown()
     const statements = this.takeDeferredStatements()
     try {
       await withPgErrors(
@@ -184,6 +191,12 @@ class WattPgTransaction implements DatabaseTransaction {
     if (this.wattCompleted) {
       throw new Error('Cannot query a completed transaction')
     }
+    this.assertDeferredOutcomeKnown()
+    // Checked before the queued statements are taken, so that they stay queued: an aborted
+    // request is never sent.
+    if (signal?.aborted) {
+      throw createAbortError()
+    }
 
     if (this.lockId === undefined) {
       if (!this.starting) {
@@ -207,7 +220,28 @@ class WattPgTransaction implements DatabaseTransaction {
       return [await this.lockedQuery(queries[0].text, queries[0].values, signal)]
     }
 
-    return this.lockedBatch(withResults(statements, queries), signal)
+    const queued = statements.length
+    try {
+      return await this.lockedBatch(withResults(statements, queries), signal)
+    } catch (error) {
+      // A PostgreSQL error means the statements ran in order up to the one that failed, so
+      // the queued ones ran (or one of them is the failure). Any other failure, a cancel
+      // above all, may have come before or after they ran: putting them back could run them
+      // twice (a second SAVEPOINT would make a later ROLLBACK TO keep the work in between),
+      // and dropping them could leave out a scope or a ROLLBACK TO.
+      if (queued > 0 && !this.wattCompleted && !(error instanceof DatabaseError)) {
+        this.deferredOutcomeUnknown = true
+      }
+      throw error
+    }
+  }
+
+  private assertDeferredOutcomeKnown(): void {
+    if (this.deferredOutcomeUnknown) {
+      throw new Error(
+        'Cannot use a transaction whose deferred statements may not have run: roll it back'
+      )
+    }
   }
 
   private async startWith(

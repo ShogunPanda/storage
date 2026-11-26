@@ -158,33 +158,6 @@ export interface ObjectForWrite {
   object?: Obj
 }
 
-/**
- * Database.lockObjectForWrite as three steps: waitObjectLock, then findBucketById FOR SHARE
- * (with versioning) and findObject FOR UPDATE.
- */
-export async function lockObjectForWriteInTurn(
-  db: Pick<Database, 'waitObjectLock' | 'findBucketById' | 'findObject'>,
-  bucketId: string,
-  objectName: string,
-  options: ObjectForWriteOptions
-): Promise<ObjectForWrite> {
-  await db.waitObjectLock(bucketId, objectName, undefined, { timeout: options.lockTimeout })
-
-  // Lock order shared by every writer: advisory key lock, then the bucket's shared status
-  // lock, then row locks.
-  const versioningStatus = options.versioning
-    ? ((await db.findBucketById(bucketId, 'versioning_status', { forShare: true }))
-        .versioning_status ?? 'DISABLED')
-    : 'DISABLED'
-
-  const object = await db.findObject(bucketId, objectName, options.objectColumns, {
-    forUpdate: true,
-    dontErrorOnEmpty: true,
-  })
-
-  return { versioningStatus, object }
-}
-
 export interface DatabaseOptions<TNX> {
   tenantId: string
   reqId?: string
@@ -386,8 +359,7 @@ export interface Database {
   /**
    * What a write needs before it changes an object: waits for the object's advisory lock,
    * then reads the bucket's versioning status FOR SHARE (with versioning) and the object FOR
-   * UPDATE, as lockObjectForWriteInTurn does. Where the transaction allows it, all three
-   * cost one round trip.
+   * UPDATE, in that order. Where the transaction allows it, all three cost one round trip.
    */
   lockObjectForWrite(
     bucketId: string,

@@ -566,6 +566,39 @@ describe('StoragePgDB testPermission', () => {
     expect(transaction.commit).not.toHaveBeenCalled()
   })
 
+  test('runs a single-statement probe on its own rolled-back executor', async () => {
+    const probeQuery = vi.fn().mockResolvedValue({ rows: [], rowCount: 0 })
+    const { log, probe, storage } = createScopeTrackingFixture({
+      rollbackStatementExecutor: () => ({ query: probeQuery }),
+    })
+
+    await storage.testPermission((db) => probe(db), { singleStatement: true })
+
+    expect(probeQuery).toHaveBeenCalledTimes(1)
+    expect(log).toEqual([])
+  })
+
+  test('probes again in a regular transaction when a single-statement probe runs more', async () => {
+    const probeQuery = vi.fn().mockResolvedValue({ rows: [], rowCount: 0 })
+    const { log, probe, storage } = createScopeTrackingFixture({
+      rollbackStatementExecutor: () => ({ query: probeQuery }),
+    })
+
+    const answer = await storage.testPermission(
+      async (db) => {
+        await probe(db)
+        // The second statement fails on the single-statement executor, even if caught.
+        await probe(db).catch(() => undefined)
+        return 'allowed'
+      },
+      { singleStatement: true }
+    )
+
+    expect(answer).toBe('allowed')
+    expect(probeQuery).toHaveBeenCalledTimes(1)
+    expect(log).toEqual(['BEGIN', 'SCOPE authenticated', 'QUERY', 'QUERY', 'ROLLBACK'])
+  })
+
   test('rolls back a nested savepoint and rethrows callback failures unchanged', async () => {
     const { connection, storage, transaction } = createNestedTestPermissionFixture()
     const error = new Error('nested permission denied')
@@ -591,7 +624,9 @@ describe('StoragePgDB testPermission', () => {
   })
 })
 
-function createScopeTrackingFixture() {
+function createScopeTrackingFixture(
+  options: { rollbackStatementExecutor?: () => DatabaseExecutor } = {}
+) {
   const log: string[] = []
   const transaction = {
     commit: vi.fn(async () => {
@@ -627,6 +662,7 @@ function createScopeTrackingFixture() {
         log.push(`SCOPE ${role}`)
       }),
       asSuperUser: vi.fn(() => createConnection('service_role')),
+      rollbackStatementExecutor: options.rollbackStatementExecutor,
     }) as unknown as PgTenantConnection
   const storage = new StoragePgDB(createConnection('authenticated'), {
     tenantId: 'scope-tracking-tenant',
