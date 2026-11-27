@@ -1,6 +1,7 @@
 import { getMessaging } from '@platformatic/globals'
 import { setupLoopbackMessaging } from '@platformatic/runtime'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { BatchQuery } from './batch-query.js'
 import type { DatabaseErrorResponse } from './errors.js'
 import type { create } from './index.js'
 import { DATABASE_MESSAGES } from './protocol.js'
@@ -12,6 +13,12 @@ type MockClient = {
   queries: Array<{ sql: string; values?: unknown[] }>
   query: ReturnType<typeof vi.fn>
   release: ReturnType<typeof vi.fn>
+  // Set by the mocked cancelQuery: PostgreSQL interrupts the statement this backend runs.
+  cancelRequested?: boolean
+}
+
+class MockDatabaseError extends Error {
+  code?: string
 }
 
 type MockedEnvironment = {
@@ -37,34 +44,84 @@ type HeldStatement = { sql: string; until: Promise<unknown> }
 
 function createMockClient(
   rows: Record<string, unknown>[],
-  failures: { begin: number; sql?: string },
+  failures: { begin: number; beginError?: () => Error; sql?: string },
   held?: HeldStatement
 ): MockClient {
+  const run = async (config: string | QueryConfig, values?: unknown[]): Promise<MockResult> => {
+    const sql = typeof config === 'string' ? config : config.text
+    client.queries.push({ sql, values: typeof config === 'string' ? values : config.values })
+    if (sql === held?.sql) {
+      await held.until
+      if (client.cancelRequested) {
+        client.cancelRequested = false
+        throw Object.assign(new MockDatabaseError('canceling statement due to user request'), {
+          code: '57014',
+        })
+      }
+    }
+    if (sql.startsWith('BEGIN') && failures.begin > 0) {
+      failures.begin--
+      throw failures.beginError?.() ?? new Error('Connection terminated unexpectedly')
+    }
+    if (sql === failures.sql) {
+      throw new Error('relation "missing" does not exist')
+    }
+    // Statements run for storage workers use array row mode with raw text values.
+    if (typeof config !== 'string' && config.rowMode === 'array') {
+      return toRawResult(rows)
+    }
+    return { rowCount: rows.length, rows, fields: [] }
+  }
+
   const client: MockClient = {
     queries: [],
-    query: vi.fn(async (config: string | QueryConfig, values?: unknown[]) => {
-      const sql = typeof config === 'string' ? config : config.text
-      client.queries.push({ sql, values: typeof config === 'string' ? values : config.values })
-      if (sql === held?.sql) {
-        await held.until
-      }
-      if (sql.startsWith('BEGIN') && failures.begin > 0) {
-        failures.begin--
-        throw new Error('Connection terminated unexpectedly')
-      }
-      if (sql === failures.sql) {
-        throw new Error('relation "missing" does not exist')
-      }
-      // Statements run for storage workers use array row mode with raw text values.
-      if (typeof config !== 'string' && config.rowMode === 'array') {
-        return toRawResult(rows)
-      }
-      return { rowCount: rows.length, rows, fields: [] }
-    }),
+    query: vi.fn((config: string | QueryConfig | BatchQuery, values?: unknown[]) =>
+      typeof config === 'object' && 'submit' in config
+        ? runBatchQuery(config, run)
+        : run(config, values)
+    ),
     release: vi.fn(),
   }
 
   return client
+}
+
+type MockResult = {
+  rowCount: number
+  rows: unknown[]
+  fields: Array<{ name: string; dataTypeID: number }>
+}
+
+const mockConnection = {
+  stream: { cork: () => undefined, uncork: () => undefined },
+  parse: () => undefined,
+  bind: () => undefined,
+  describe: () => undefined,
+  execute: () => undefined,
+  flush: () => undefined,
+  sync: () => undefined,
+}
+
+// Writes a BatchQuery and plays it the way PostgreSQL answers one: statement by statement,
+// and nothing after the first failure.
+async function runBatchQuery(batch: BatchQuery, run: (config: QueryConfig) => Promise<MockResult>) {
+  batch.submit(mockConnection as never)
+  for (const statement of batch.statements) {
+    let result: MockResult
+    try {
+      result = await run({ text: statement.text, values: statement.values, rowMode: 'array' })
+    } catch (error) {
+      batch.handleError(error)
+      return batch
+    }
+    batch.handleRowDescription({ fields: result.fields as never })
+    for (const row of result.rows) {
+      batch.handleDataRow({ fields: row as Array<string | null> })
+    }
+    batch.handleCommandComplete({ text: `SELECT ${result.rowCount}` })
+  }
+  batch.handleReadyForQuery()
+  return batch
 }
 
 function toRawResult(rows: Record<string, unknown>[]) {
@@ -84,6 +141,8 @@ async function loadApp(
     env?: Record<string, string>
     queryRows?: Record<string, unknown>[]
     beginFailures?: number
+    /** The error the failing BEGINs throw: by default, a dropped connection. */
+    beginError?: () => Error
     failingSql?: string
     worker?: { id: string; count: number }
     /** Connections are handed out only once this settles. */
@@ -96,7 +155,11 @@ async function loadApp(
   const clients: MockClient[] = []
   const pools: MockedEnvironment['pools'] = []
   const queryRows = options.queryRows || [{ ok: true }]
-  const failures = { begin: options.beginFailures ?? 0, sql: options.failingSql }
+  const failures = {
+    begin: options.beginFailures ?? 0,
+    beginError: options.beginError,
+    sql: options.failingSql,
+  }
 
   process.env = {
     ...originalEnv,
@@ -110,10 +173,6 @@ async function loadApp(
     const types = {
       getTypeParser: vi.fn(),
       setTypeParser: vi.fn(),
-    }
-
-    class MockDatabaseError extends Error {
-      code?: string
     }
 
     class MockPool {
@@ -149,12 +208,19 @@ async function loadApp(
       DatabaseError: MockDatabaseError,
       Pool: MockPool,
       types,
-      default: { types },
+      default: { types, utils: { prepareValue: (value: unknown) => value } },
     }
   })
 
   vi.doMock('pg/lib/connection', () => ({
     default: class MockPgConnection {},
+  }))
+
+  vi.doMock('@internal/database/postgres/cancellation', async (importOriginal) => ({
+    ...(await importOriginal<object>()),
+    cancelQuery: vi.fn(async (client: MockClient) => {
+      client.cancelRequested = true
+    }),
   }))
 
   // We need dynamic import due to the mocking of PostgreSQL modules above
@@ -625,8 +691,107 @@ describe('database Watt application messaging handlers', () => {
     expect(clients[0].release).toHaveBeenCalledWith(undefined)
   })
 
-  it('retries BEGIN of a batch on a broken pooled connection', async () => {
-    const { clients, messaging } = await loadApp({ beginFailures: 1 })
+  it('rolls back a probe batch and releases its connection', async () => {
+    const { clients, messaging } = await loadApp()
+
+    const response = await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT set_config($1, $2, true)' }, { sql: 'INSERT INTO t VALUES (1)' }],
+      commit: false,
+      rollback: true,
+    })
+
+    expect(response).toEqual(okResponse)
+    expect(clients[0].queries.map((query) => query.sql)).toEqual([
+      'BEGIN',
+      'SELECT set_config($1, $2, true)',
+      'INSERT INTO t VALUES (1)',
+      'ROLLBACK',
+    ])
+    expect(clients[0].release).toHaveBeenCalledTimes(1)
+    expect(clients[0].release.mock.calls[0][0]).toBeUndefined()
+  })
+
+  it('rejects a batch that asks to both commit and roll back', async () => {
+    const { clients, messaging } = await loadApp()
+
+    const response = await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT 1' }],
+      commit: true,
+      rollback: true,
+    })
+
+    expect(response).toMatchObject({ code: 'PROTOCOL_ERROR' })
+    expect(clients).toHaveLength(0)
+  })
+
+  it('runs several statements on a pinned connection with one message', async () => {
+    const { clients, messaging } = await loadApp()
+
+    const batch = (await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT 1' }],
+      commit: false,
+    })) as typeof okResponse & { lockId: string }
+    const response = await messaging.send('database', 'database.lockedBatch', {
+      lockId: batch.lockId,
+      statements: [{ sql: 'SAVEPOINT a' }, { sql: 'SELECT 2', result: true }, { sql: 'SELECT 3' }],
+    })
+    const commit = await messaging.send('database', 'database.commitTransaction', {
+      lockId: batch.lockId,
+      statements: [{ sql: 'RELEASE SAVEPOINT a' }],
+    })
+
+    expect(response).toEqual({ ...okResponse, results: [okResponse] })
+    expect(commit).toEqual({ committed: true })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual([
+      'BEGIN',
+      'SELECT 1',
+      'SAVEPOINT a',
+      'SELECT 2',
+      'SELECT 3',
+      'RELEASE SAVEPOINT a',
+      'COMMIT',
+    ])
+    expect(clients[0].release).toHaveBeenCalledWith(undefined)
+  })
+
+  it('keeps the transaction of a failed locked batch for the caller to roll back', async () => {
+    const { clients, messaging } = await loadApp({ failingSql: 'SELECT broken' })
+
+    const batch = (await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'SELECT 1' }],
+      commit: false,
+    })) as typeof okResponse & { lockId: string }
+    const response = (await messaging.send('database', 'database.lockedBatch', {
+      lockId: batch.lockId,
+      statements: [{ sql: 'SELECT broken' }, { sql: 'SELECT 2' }],
+    })) as DatabaseErrorResponse
+    const rollback = await messaging.send('database', 'database.rollbackTransaction', {
+      lockId: batch.lockId,
+    })
+
+    expect(response).toMatchObject({ message: 'relation "missing" does not exist' })
+    expect(response.connectionDiscarded).toBeUndefined()
+    expect(rollback).toEqual({ rolledBack: true })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual([
+      'BEGIN',
+      'SELECT 1',
+      'SELECT broken',
+      'ROLLBACK',
+    ])
+  })
+
+  it('retries a batch whose BEGIN a pooler refused', async () => {
+    const { clients, messaging } = await loadApp({
+      beginFailures: 1,
+      beginError: () =>
+        Object.assign(new MockDatabaseError('no more connections allowed (max_client_conn)'), {
+          code: '08P01',
+        }),
+    })
 
     const response = await messaging.send('database', 'database.batch', {
       destination: createDestination(),
@@ -638,6 +803,23 @@ describe('database Watt application messaging handlers', () => {
     expect(clients).toHaveLength(2)
     expect(clients[0].release).toHaveBeenCalledWith(expect.any(Error))
     expect(clients[1].queries.map((query) => query.sql)).toEqual(['BEGIN', 'SELECT 1', 'COMMIT'])
+  })
+
+  it('does not retry a batch whose connection failed after it was written', async () => {
+    // BEGIN's reply is missing, but the batch may have committed with its replies lost.
+    const { clients, messaging } = await loadApp({ beginFailures: 1 })
+
+    const response = await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'INSERT 1' }],
+      commit: true,
+    })
+
+    expect(response).toMatchObject({
+      message: 'Connection terminated unexpectedly',
+      connectionDiscarded: true,
+    })
+    expect(clients).toHaveLength(1)
   })
 
   it.each([
@@ -684,7 +866,7 @@ describe('database Watt application messaging handlers', () => {
     expect(clients[0].release).toHaveBeenCalledWith()
   })
 
-  it('runs no further batch statement once cancelled, and closes the connection', async () => {
+  it('interrupts the running batch statement once cancelled, and closes the connection', async () => {
     const finish = deferred()
     const { clients, messaging } = await loadApp({
       heldStatement: { sql: 'SELECT 1', until: finish.promise },
@@ -702,8 +884,10 @@ describe('database Watt application messaging handlers', () => {
     })
     finish.resolve()
 
+    // PostgreSQL cancels SELECT 1 and skips the rest of the batch, COMMIT included.
     expect(await batch).toMatchObject({
-      code: 'CANCELLED',
+      code: 'POSTGRES_ERROR',
+      sqlState: '57014',
       requestId: 'req-1',
       connectionDiscarded: true,
     })
@@ -745,6 +929,74 @@ describe('database Watt application messaging handlers', () => {
     expect(clients[0].queries.map((query) => query.sql)).toEqual(['BEGIN', 'SELECT 1', 'COMMIT'])
     // No cancel reached the backend, so the connection goes back to the pool.
     expect(clients[0].release).toHaveBeenCalledWith(undefined)
+  })
+
+  it('cancels a queued locked batch without touching the running statement', async () => {
+    const finish = deferred()
+    const { clients, messaging } = await loadApp({
+      heldStatement: { sql: 'SELECT 1', until: finish.promise },
+    })
+    const { lockId } = (await messaging.send('database', 'database.beginTransaction', {
+      destination: createDestination(),
+    })) as { lockId: string }
+
+    const running = messaging.send('database', 'database.lockedQuery', {
+      lockId,
+      requestId: 'req-a',
+      sql: 'SELECT 1',
+    })
+    const queued = messaging.send('database', 'database.lockedBatch', {
+      lockId,
+      requestId: 'req-b',
+      statements: [{ sql: 'SELECT 2' }, { sql: 'SELECT 3' }],
+    })
+    await nextTurn()
+    expect(
+      await messaging.send('database', 'database.cancel', { requestId: 'req-b', lockId })
+    ).toEqual({ cancelled: true })
+    finish.resolve()
+
+    expect(await running).toEqual(okResponse)
+    expect(await queued).toMatchObject({ code: 'CANCELLED', requestId: 'req-b' })
+    expect(await messaging.send('database', 'database.commitTransaction', { lockId })).toEqual({
+      committed: true,
+    })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual(['BEGIN', 'SELECT 1', 'COMMIT'])
+    expect(clients[0].release).toHaveBeenCalledWith(undefined)
+  })
+
+  it('interrupts the running statement of a cancelled locked batch', async () => {
+    const finish = deferred()
+    const { clients, messaging } = await loadApp({
+      heldStatement: { sql: 'SELECT 1', until: finish.promise },
+    })
+    const { lockId } = (await messaging.send('database', 'database.beginTransaction', {
+      destination: createDestination(),
+    })) as { lockId: string }
+
+    const batch = messaging.send('database', 'database.lockedBatch', {
+      lockId,
+      requestId: 'req-1',
+      statements: [{ sql: 'SELECT 1' }, { sql: 'SELECT 2' }],
+    })
+    await nextTurn()
+    expect(
+      await messaging.send('database', 'database.cancel', { requestId: 'req-1', lockId })
+    ).toEqual({ cancelled: true })
+    finish.resolve()
+
+    // PostgreSQL cancels SELECT 1 and skips SELECT 2.
+    expect(await batch).toMatchObject({
+      code: 'POSTGRES_ERROR',
+      sqlState: '57014',
+      requestId: 'req-1',
+    })
+    expect(await messaging.send('database', 'database.rollbackTransaction', { lockId })).toEqual({
+      rolledBack: true,
+    })
+    expect(clients[0].queries.map((query) => query.sql)).toEqual(['BEGIN', 'SELECT 1', 'ROLLBACK'])
+    // A cancel was sent on this backend: it is closed rather than reused.
+    expect(clients[0].release).toHaveBeenCalledWith(expect.any(Error))
   })
 
   it('closes pools and rejects new work after shutdown starts', async () => {

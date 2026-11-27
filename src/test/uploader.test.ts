@@ -8,7 +8,7 @@ import { getConfig } from '../config'
 import { ErrorCode, isStorageError, StorageBackendError } from '../internal/errors'
 import * as monitoringMetrics from '../internal/monitoring/metrics'
 import { withOptionalVersion } from '../storage/backend'
-import { replacedContent } from '../storage/database'
+import { lockObjectForWriteInTurn, replacedContent } from '../storage/database'
 import { ObjectAdminDelete, ObjectCreatedPostEvent, ObjectCreatedPutEvent } from '../storage/events'
 import { TenantLocation } from '../storage/locator'
 import { fileUploadFromRequest, Uploader } from '../storage/uploader'
@@ -59,7 +59,13 @@ function createCompleteUploadDb(
   // scope also serves the committed-version lookup outside the transaction.
   const superUserDb = {
     withTransaction: vi.fn(async (fn: (db: unknown) => unknown) =>
-      fn({ ...transactionDb, asCaller: () => db })
+      fn({
+        ...transactionDb,
+        // completeUpload's lock and reads, made of the mocked steps.
+        lockObjectForWrite: (...args: Parameters<UploaderDatabase['lockObjectForWrite']>) =>
+          lockObjectForWriteInTurn(transactionDb as never, ...args),
+        asCaller: () => db,
+      })
     ),
     findObject: vi.fn().mockResolvedValue(undefined),
     ...committedVersionLookup,

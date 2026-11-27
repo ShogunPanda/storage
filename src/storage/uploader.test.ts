@@ -25,7 +25,7 @@ import uploadSignedObject from '../http/routes/object/uploadSignedObject'
 import { onCreate, onUploadFinish } from '../http/routes/tus/lifecycle'
 import { authSchema, errorSchema } from '../http/schemas'
 import { FileBackend } from './backend/file'
-import type { Database } from './database'
+import { type Database, lockObjectForWriteInTurn } from './database'
 import { ObjectCreatedCopyEvent, ObjectCreatedPostEvent } from './events'
 import { TenantLocation } from './locator'
 import { S3ProtocolHandler } from './protocols/s3/s3-handler'
@@ -33,6 +33,8 @@ import { FileStore } from './protocols/tus/file-store'
 import { UploadId } from './protocols/tus/upload-id'
 import { AssetRenderer } from './renderer/asset'
 import { Storage } from './storage'
+
+type LockObjectForWriteArgs = Parameters<Database['lockObjectForWrite']>
 
 type SavedObject = Parameters<Database['upsertObject']>[0] & { id: string }
 
@@ -59,6 +61,8 @@ async function createFixture(allowedMimeTypes: string[] | null) {
     withTransaction: async (fn: (transaction: Database) => Promise<unknown>) => fn(database),
     waitObjectLock: vi.fn().mockResolvedValue(true),
     findObject: vi.fn().mockResolvedValue(undefined),
+    lockObjectForWrite: (...args: LockObjectForWriteArgs) =>
+      lockObjectForWriteInTurn(database, ...args),
     hasMigration: vi.fn().mockResolvedValue(false),
     upsertObject: async (data: Parameters<Database['upsertObject']>[0]) => {
       saved = { id: randomUUID(), ...data }

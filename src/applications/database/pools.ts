@@ -6,8 +6,9 @@ import { buildSearchPath } from '@internal/database/postgres/sql'
 import { getSslSettings } from '@internal/database/postgres/ssl'
 import { installPostgresTypeParsers } from '@internal/database/postgres/type-parsers'
 import { getLogger } from '@platformatic/globals'
-import { Pool, type PoolClient, type QueryResult } from 'pg'
+import { DatabaseError, Pool, type PoolClient, type QueryResult } from 'pg'
 import type { StorageConfigType } from '../../config.js'
+import { BatchQuery, type BatchQueryStatement, type RawRow } from './batch-query.js'
 import { releaseErrorFor } from './cancellation.js'
 import { busyError, cancelledError, DatabaseWattError } from './errors.js'
 import type {
@@ -23,7 +24,7 @@ import type {
 // the other session statements still use them.
 installPostgresTypeParsers()
 
-type RawRow = Array<string | null>
+export type { RawRow }
 
 const passThrough = (value: string) => value
 
@@ -231,7 +232,8 @@ export class PoolRegistry {
         // Same session defaults as the direct tenant pools: external poolers get
         // search_path per transaction through the scope statement instead.
         options: destination.isExternalPool ? undefined : `-c search_path=${this.searchPath}`,
-        pipeline: this.config.databaseEnablePipelining,
+        // No pg pipelining: a batch is already one round trip (BatchQuery), and pg refuses
+        // custom queries on a pipelining client.
         ssl: getSslSettings({
           connectionString: destination.connectionString,
           databaseSSLRootCert: this.config.databaseSSLRootCert,
@@ -462,109 +464,68 @@ export class BeginError extends Error {
   }
 }
 
+export type BatchEnd = 'COMMIT' | 'ROLLBACK'
+
 /**
- * Runs BEGIN, `statements` and, when asked, COMMIT on one connection, returning the
- * result of every statement, in order. A failed BEGIN is thrown as a BeginError so callers can
- * retry it on another connection: nothing else was sent.
- *
- * On a pipelining client the statements and COMMIT are written at once (one socket write)
- * once BEGIN has succeeded, so two round trips in all. Otherwise the statements run one
- * after the other. Either way it costs a single message from the storage worker.
- *
- * Once `signal` is aborted no further statement is sent (nor COMMIT): the batch throws a
- * CANCELLED error and leaves its transaction open for the caller to roll back.
+ * Runs BEGIN, `statements` and, when asked, COMMIT or ROLLBACK on one connection, returning
+ * the result of every statement, in order. A failure that proves nothing ran is thrown as a
+ * BeginError, so callers can retry it on another connection (see runStatements).
  */
-export async function runBatch(
+export function runBatch(
   client: PoolClient,
   beginStatement: string,
   statements: BatchStatement[],
-  commit: boolean,
+  end?: BatchEnd,
   signal?: AbortSignal
 ): Promise<QueryResult<RawRow>[]> {
-  if ((client as PoolClient & { pipeline?: boolean }).pipeline) {
-    return runPipelinedBatch(client, beginStatement, statements, commit, signal)
-  }
+  return runStatements(client, statements, { begin: beginStatement, end, signal })
+}
+
+/**
+ * Runs `statements` on one connection, after `begin` and before `end` when they are given,
+ * and returns the result of every statement, in order. Everything is written at once and
+ * ends with a single Sync (see BatchQuery): one round trip, and after a failure PostgreSQL
+ * runs nothing else, `end` included. A transaction that was open stays open, aborted, for
+ * the caller to roll back.
+ *
+ * A failure before the batch was written, or an error answering BEGIN, is thrown as a
+ * BeginError: nothing ran. A connection that fails after the write and before BEGIN's reply
+ * is thrown as it is: the transaction may have committed with its replies lost, so it must
+ * not be retried.
+ *
+ * Once `signal` is aborted nothing is sent; past that point a cancel interrupts the
+ * statement PostgreSQL is running.
+ */
+export async function runStatements(
+  client: PoolClient,
+  statements: BatchStatement[],
+  { begin, end, signal }: { begin?: string; end?: BatchEnd; signal?: AbortSignal } = {}
+): Promise<QueryResult<RawRow>[]> {
+  throwIfCancelled(signal)
+
+  const query = new BatchQuery(toBatchQueryStatements(statements), begin, end)
+  client.query(query)
 
   try {
-    await client.query(beginStatement)
+    return await query.promise
   } catch (error) {
-    throw new BeginError(error)
+    if (!query.beganTransaction && (!query.submitted || error instanceof DatabaseError)) {
+      throw new BeginError(error)
+    }
+    throw error
   }
+}
 
-  const results = new Array<QueryResult<RawRow>>(statements.length)
+function toBatchQueryStatements(statements: BatchStatement[]): BatchQueryStatement[] {
+  const result = new Array<BatchQueryStatement>(statements.length)
   for (let i = 0; i < statements.length; i++) {
-    throwIfCancelled(signal)
-    results[i] = await runQuery(client, statements[i].sql, statements[i].values)
+    result[i] = { text: statements[i].sql, values: statements[i].values }
   }
-
-  if (commit) {
-    throwIfCancelled(signal)
-    await client.query('COMMIT')
-  }
-
-  return results
+  return result
 }
 
 function throwIfCancelled(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw cancelledError()
   }
-}
-
-async function runPipelinedBatch(
-  client: PoolClient,
-  beginStatement: string,
-  statements: BatchStatement[],
-  commit: boolean,
-  signal: AbortSignal | undefined
-): Promise<QueryResult<RawRow>[]> {
-  const stream = (
-    client as PoolClient & {
-      connection?: { stream?: Partial<NodeJS.WritableStream> & { cork?(): void; uncork?(): void } }
-    }
-  ).connection?.stream
-  // BEGIN has to succeed before anything else is sent. pg ends every pipelined query with
-  // its own Sync, so statements queued behind a failed BEGIN would still run, each in its
-  // own autocommit transaction: the scope statement's set_config(..., true) would only
-  // last for itself and the query would run, and commit, as the pool's login role.
-  try {
-    await client.query(beginStatement)
-  } catch (error) {
-    throw new BeginError(error)
-  }
-
-  // Past this point a cancel interrupts the statement PostgreSQL is running, and the rest
-  // of the pipeline fails with the aborted transaction.
-  throwIfCancelled(signal)
-
-  const pending: Promise<unknown>[] = []
-
-  // pg submits pipelined queries synchronously: corking merges them into one write.
-  stream?.cork?.()
-  try {
-    for (const statement of statements) {
-      pending.push(runQuery(client, statement.sql, statement.values))
-    }
-    if (commit) {
-      pending.push(client.query('COMMIT'))
-    }
-  } finally {
-    stream?.uncork?.()
-  }
-
-  const settled = await Promise.allSettled(pending)
-
-  // Inside the transaction, the first failure is the cause; later statements only report
-  // the aborted transaction (and COMMIT turns into a ROLLBACK).
-  for (const outcome of settled) {
-    if (outcome.status === 'rejected') {
-      throw outcome.reason
-    }
-  }
-
-  const results = new Array<QueryResult<RawRow>>(statements.length)
-  for (let i = 0; i < statements.length; i++) {
-    results[i] = (settled[i] as PromiseFulfilledResult<QueryResult<RawRow>>).value
-  }
-  return results
 }

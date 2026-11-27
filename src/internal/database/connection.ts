@@ -42,6 +42,21 @@ export interface DatabaseTransaction extends DatabaseExecutor {
   isCompleted(): boolean
   commit(): Promise<void>
   rollback(): Promise<void>
+  /**
+   * Optional: queues a statement whose result nobody reads (a scope statement, a savepoint
+   * command) to run before the next query, or before COMMIT, in the same round trip.
+   * ROLLBACK drops it, and an error it raises is reported by that next query.
+   * Transactions that do not provide it run such statements right away.
+   */
+  defer?(statement: DatabaseStatement): void
+  /**
+   * Optional: runs `statements` in order in one round trip and returns every statement's
+   * result. The first failure is thrown.
+   */
+  queryBatch?(
+    statements: DatabaseStatement[],
+    options?: DatabaseQueryOptions
+  ): Promise<QueryResult[]>
 }
 
 export interface DatabaseTransactionalExecutor extends DatabaseExecutor {
@@ -62,6 +77,11 @@ export interface TenantConnection extends DatabaseTransactionalExecutor {
    * individual steps. Connections that do not provide it take the regular path.
    */
   singleStatementExecutor?(options?: TransactionOptions): DatabaseExecutor
+  /**
+   * Optional: like singleStatementExecutor, but the transaction is rolled back instead of
+   * committed, for permission probes: the answer is whether the statement succeeds.
+   */
+  rollbackStatementExecutor?(options?: TransactionOptions): DatabaseExecutor
   /**
    * Optional: runs `statements` in one transaction that costs a single round trip, each
    * with this connection's scope or, when flagged `asSuperUser`, the super user's, and

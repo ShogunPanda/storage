@@ -1,11 +1,11 @@
 import { isConnectionStateError } from '@internal/database/postgres/pool-errors'
 import hyperid from 'hyperid'
-import type { PoolClient } from 'pg'
+import type { PoolClient, QueryResult } from 'pg'
 import type { StorageConfigType } from '../../config.js'
 import { releaseErrorFor } from './cancellation.js'
 import { DatabaseWattError } from './errors.js'
-import { runQuery, toQueryResponse } from './pools.js'
-import type { DatabasePoolTarget, RawQueryResponse } from './protocol.js'
+import { type RawRow, runQuery, runStatements, toQueryResponse } from './pools.js'
+import type { BatchStatement, DatabasePoolTarget, RawQueryResponse } from './protocol.js'
 
 // Lifetime bound for a transaction its caller holds open (holdOpen): a TUS upload lock
 // lasts as long as the upload, which has no fixed limit, so it gets the same fixed safety
@@ -121,6 +121,28 @@ export class LockRegistry {
     )
   }
 
+  /**
+   * Runs several statements on the locked connection in one round trip (see runStatements).
+   * Like query(), `onStart` runs before the first one; once `signal` is aborted nothing is
+   * sent.
+   */
+  async batch(
+    lockId: string,
+    statements: BatchStatement[],
+    owner: object | undefined,
+    onStart?: (client: PoolClient) => void,
+    signal?: AbortSignal
+  ): Promise<QueryResult<RawRow>[]> {
+    return this.withLock(
+      lockId,
+      (lock) => {
+        onStart?.(lock.client)
+        return runStatements(lock.client, statements, { signal })
+      },
+      owner
+    )
+  }
+
   async release(lockId: string, owner: object | undefined): Promise<void> {
     await this.withLock(
       lockId,
@@ -135,7 +157,12 @@ export class LockRegistry {
     )
   }
 
-  async commit(lockId: string, owner: object | undefined): Promise<void> {
+  // `statements` (deferred by the caller) run first, written together with COMMIT.
+  async commit(
+    lockId: string,
+    owner: object | undefined,
+    statements?: BatchStatement[]
+  ): Promise<void> {
     await this.withLock(
       lockId,
       async (lock) => {
@@ -145,7 +172,11 @@ export class LockRegistry {
 
         let releaseError: Error | undefined
         try {
-          await lock.client.query('COMMIT')
+          if (statements?.length) {
+            await runStatements(lock.client, statements, { end: 'COMMIT' })
+          } else {
+            await lock.client.query('COMMIT')
+          }
         } catch (error) {
           releaseError = error instanceof Error ? error : new Error(String(error))
           throw error
