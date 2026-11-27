@@ -42,9 +42,10 @@ vi.mock('pg', () => ({
   DatabaseError: class DatabaseError extends Error {},
   Pool: pgMock.Pool,
   types: pgMock.types,
-  default: { types: pgMock.types },
+  default: { types: pgMock.types, utils: { prepareValue: (value: unknown) => value } },
 }))
 
+import { DatabaseError } from 'pg'
 import { getConfig } from '../../config.js'
 import type { BatchQuery } from './batch-query.js'
 import { BeginError, PoolRegistry, runBatch, runStatements } from './pools.js'
@@ -211,11 +212,22 @@ describe('database pool registry', () => {
 describe('runBatch', () => {
   type PlayedStatement = { text: string; reply: 'ok' | Error }
 
-  // A client that answers a BatchQuery the way PostgreSQL does: in order, and nothing after
-  // the first failure. `replies` decides each statement's outcome by its text.
+  const connection = {
+    stream: { cork: () => undefined, uncork: () => undefined },
+    parse: () => undefined,
+    bind: () => undefined,
+    describe: () => undefined,
+    execute: () => undefined,
+    flush: () => undefined,
+    sync: () => undefined,
+  }
+
+  // A client that writes a BatchQuery and answers it the way PostgreSQL does: in order, and
+  // nothing after the first failure. `replies` decides each statement's outcome by its text.
   function client(replies: Record<string, Error> = {}) {
     const played: PlayedStatement[] = []
     const query = vi.fn((batch: BatchQuery) => {
+      batch.submit(connection as never)
       queueMicrotask(() => {
         for (const statement of batch.statements) {
           const failure = replies[statement.text]
@@ -263,8 +275,8 @@ describe('runBatch', () => {
     expect(results).toMatchObject([row, row])
   })
 
-  it('throws a BeginError when BEGIN fails, and nothing behind it runs', async () => {
-    const refused = new Error('no more connections allowed')
+  it('throws a BeginError when BEGIN is refused, and nothing behind it runs', async () => {
+    const refused = new DatabaseError('no more connections allowed', 0, 'error')
     const { client: pgClient, played } = client({ BEGIN: refused })
 
     const failure = runBatch(pgClient, 'BEGIN', [{ sql: 'INSERT 1' }], 'COMMIT')
@@ -272,6 +284,29 @@ describe('runBatch', () => {
     await expect(failure).rejects.toBeInstanceOf(BeginError)
     await expect(failure).rejects.toMatchObject({ original: refused })
     expect(played).toEqual([{ text: 'BEGIN', reply: refused }])
+  })
+
+  it('throws a BeginError when the batch could not be written', async () => {
+    const broken = new Error('Client has encountered a connection error and is not queryable')
+    // As pg does on a client that already failed: the query fails without being submitted.
+    const query = vi.fn((batch: BatchQuery) => {
+      queueMicrotask(() => batch.handleError(broken))
+      return batch
+    })
+
+    const failure = runBatch({ query } as never, 'BEGIN', [{ sql: 'INSERT 1' }], 'COMMIT')
+
+    await expect(failure).rejects.toBeInstanceOf(BeginError)
+    await expect(failure).rejects.toMatchObject({ original: broken })
+  })
+
+  it('throws a connection failure after the write as it is: the batch may have run', async () => {
+    // BEGIN's reply is missing, but the transaction could have committed with the replies
+    // lost: running it again on another connection could repeat its writes.
+    const lost = new Error('Connection terminated unexpectedly')
+    const { client: pgClient } = client({ BEGIN: lost })
+
+    await expect(runBatch(pgClient, 'BEGIN', [{ sql: 'INSERT 1' }], 'COMMIT')).rejects.toBe(lost)
   })
 
   it('throws the statement error itself once BEGIN has run', async () => {

@@ -6,7 +6,7 @@ import { buildSearchPath } from '@internal/database/postgres/sql'
 import { getSslSettings } from '@internal/database/postgres/ssl'
 import { installPostgresTypeParsers } from '@internal/database/postgres/type-parsers'
 import { getLogger } from '@platformatic/globals'
-import { Pool, type PoolClient, type QueryResult } from 'pg'
+import { DatabaseError, Pool, type PoolClient, type QueryResult } from 'pg'
 import type { StorageConfigType } from '../../config.js'
 import { BatchQuery, type BatchQueryStatement, type RawRow } from './batch-query.js'
 import { releaseErrorFor } from './cancellation.js'
@@ -468,8 +468,8 @@ export type BatchEnd = 'COMMIT' | 'ROLLBACK'
 
 /**
  * Runs BEGIN, `statements` and, when asked, COMMIT or ROLLBACK on one connection, returning
- * the result of every statement, in order. A failed BEGIN is thrown as a BeginError so callers
- * can retry it on another connection: nothing behind it ran.
+ * the result of every statement, in order. A failure that proves nothing ran is thrown as a
+ * BeginError, so callers can retry it on another connection (see runStatements).
  */
 export function runBatch(
   client: PoolClient,
@@ -486,7 +486,12 @@ export function runBatch(
  * and returns the result of every statement, in order. Everything is written at once and
  * ends with a single Sync (see BatchQuery): one round trip, and after a failure PostgreSQL
  * runs nothing else, `end` included. A transaction that was open stays open, aborted, for
- * the caller to roll back. A failure before BEGIN replied is thrown as a BeginError.
+ * the caller to roll back.
+ *
+ * A failure before the batch was written, or an error answering BEGIN, is thrown as a
+ * BeginError: nothing ran. A connection that fails after the write and before BEGIN's reply
+ * is thrown as it is: the transaction may have committed with its replies lost, so it must
+ * not be retried.
  *
  * Once `signal` is aborted nothing is sent; past that point a cancel interrupts the
  * statement PostgreSQL is running.
@@ -504,7 +509,7 @@ export async function runStatements(
   try {
     return await query.promise
   } catch (error) {
-    if (!query.beganTransaction) {
+    if (!query.beganTransaction && (!query.submitted || error instanceof DatabaseError)) {
       throw new BeginError(error)
     }
     throw error

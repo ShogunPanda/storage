@@ -29,6 +29,20 @@ describe('Database application batches on PostgreSQL', () => {
     await client.end()
   })
 
+  it('is not written by a client that cannot send it', async () => {
+    const closed = new Client({ connectionString: getConfig().databaseURL })
+    await closed.connect()
+    await closed.end()
+
+    const failure = runBatch(closed as never, 'BEGIN', [{ sql: 'SELECT 1' }], 'COMMIT')
+
+    // Nothing was written, so it may be retried on another connection.
+    await expect(failure).rejects.toBeInstanceOf(BeginError)
+    await expect(failure).rejects.toMatchObject({
+      original: { message: expect.stringContaining('not queryable') },
+    })
+  })
+
   it('runs nothing behind a BEGIN that fails', async () => {
     const failure = runBatch(
       client as never,

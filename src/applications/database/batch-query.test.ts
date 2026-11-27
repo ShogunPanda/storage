@@ -96,6 +96,23 @@ describe('BatchQuery', () => {
     ])
   })
 
+  it('knows whether it was written', () => {
+    const query = new BatchQuery([{ text: 'SELECT 1' }], 'BEGIN', 'COMMIT')
+    expect(query.submitted).toBe(false)
+    query.submit(recordingConnection().connection)
+    expect(query.submitted).toBe(true)
+
+    // A value pg cannot send fails the query before anything is written.
+    const unsendable = {
+      toPostgres: () => {
+        throw new Error('cannot send')
+      },
+    }
+    const invalid = new BatchQuery([{ text: 'SELECT $1', values: [unsendable] }], 'BEGIN')
+    expect(invalid.submit(recordingConnection().connection)).toBeInstanceOf(Error)
+    expect(invalid.submitted).toBe(false)
+  })
+
   it('knows whether BEGIN replied before a failure', async () => {
     const failed = new BatchQuery([{ text: 'SELECT 1' }], 'BEGIN', 'COMMIT')
     failed.handleError(new Error('no more connections allowed'))

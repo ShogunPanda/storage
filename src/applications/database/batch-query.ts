@@ -36,9 +36,11 @@ function prepareValue(value: unknown): unknown {
  * statement runs, a failed BEGIN included. pg cannot do this with separate queries: each ends
  * with its own Sync, and statements behind a failed BEGIN would each run in autocommit.
  *
- * BEGIN is followed by a Flush, so its reply comes back as soon as it has run: if the query
- * fails before that reply (`beganTransaction` is false), BEGIN did not run and nothing behind it
- * did either.
+ * BEGIN is followed by a Flush, so its reply comes back as soon as it has run. Nothing ran when
+ * the query failed before it was written (`submitted` is false), or when an error answered
+ * BEGIN: PostgreSQL then skips everything up to the Sync. A connection that fails after the
+ * batch was written proves nothing, even before BEGIN's reply (`beganTransaction` is false):
+ * the replies can be lost after COMMIT ran.
  *
  * Rows come back as arrays of the text PostgreSQL sent, unparsed.
  */
@@ -50,6 +52,7 @@ export class BatchQuery {
   #results: QueryResult<RawRow>[]
   #index = 0
   #settled = false
+  #submitted = false
   #resolve!: (results: QueryResult<RawRow>[]) => void
   #reject!: (error: unknown) => void
 
@@ -76,6 +79,11 @@ export class BatchQuery {
     })
   }
 
+  // True once the batch has been handed to the connection to write.
+  get submitted(): boolean {
+    return this.#submitted
+  }
+
   // True once BEGIN has replied (or when there is no BEGIN).
   get beganTransaction(): boolean {
     return this.#index >= this.#first
@@ -95,6 +103,7 @@ export class BatchQuery {
 
     const connection = pgConnection as unknown as BatchQueryConnection
     const stream = connection.stream
+    this.#submitted = true
     stream.cork()
     try {
       for (let i = 0; i < this.statements.length; i++) {

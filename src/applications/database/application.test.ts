@@ -44,7 +44,7 @@ type HeldStatement = { sql: string; until: Promise<unknown> }
 
 function createMockClient(
   rows: Record<string, unknown>[],
-  failures: { begin: number; sql?: string },
+  failures: { begin: number; beginError?: () => Error; sql?: string },
   held?: HeldStatement
 ): MockClient {
   const run = async (config: string | QueryConfig, values?: unknown[]): Promise<MockResult> => {
@@ -61,7 +61,7 @@ function createMockClient(
     }
     if (sql.startsWith('BEGIN') && failures.begin > 0) {
       failures.begin--
-      throw new Error('Connection terminated unexpectedly')
+      throw failures.beginError?.() ?? new Error('Connection terminated unexpectedly')
     }
     if (sql === failures.sql) {
       throw new Error('relation "missing" does not exist')
@@ -92,9 +92,20 @@ type MockResult = {
   fields: Array<{ name: string; dataTypeID: number }>
 }
 
-// Plays a BatchQuery the way PostgreSQL answers one: statement by statement, and nothing
-// after the first failure.
+const mockConnection = {
+  stream: { cork: () => undefined, uncork: () => undefined },
+  parse: () => undefined,
+  bind: () => undefined,
+  describe: () => undefined,
+  execute: () => undefined,
+  flush: () => undefined,
+  sync: () => undefined,
+}
+
+// Writes a BatchQuery and plays it the way PostgreSQL answers one: statement by statement,
+// and nothing after the first failure.
 async function runBatchQuery(batch: BatchQuery, run: (config: QueryConfig) => Promise<MockResult>) {
+  batch.submit(mockConnection as never)
   for (const statement of batch.statements) {
     let result: MockResult
     try {
@@ -130,6 +141,8 @@ async function loadApp(
     env?: Record<string, string>
     queryRows?: Record<string, unknown>[]
     beginFailures?: number
+    /** The error the failing BEGINs throw: by default, a dropped connection. */
+    beginError?: () => Error
     failingSql?: string
     worker?: { id: string; count: number }
     /** Connections are handed out only once this settles. */
@@ -142,7 +155,11 @@ async function loadApp(
   const clients: MockClient[] = []
   const pools: MockedEnvironment['pools'] = []
   const queryRows = options.queryRows || [{ ok: true }]
-  const failures = { begin: options.beginFailures ?? 0, sql: options.failingSql }
+  const failures = {
+    begin: options.beginFailures ?? 0,
+    beginError: options.beginError,
+    sql: options.failingSql,
+  }
 
   process.env = {
     ...originalEnv,
@@ -191,7 +208,7 @@ async function loadApp(
       DatabaseError: MockDatabaseError,
       Pool: MockPool,
       types,
-      default: { types },
+      default: { types, utils: { prepareValue: (value: unknown) => value } },
     }
   })
 
@@ -767,8 +784,14 @@ describe('database Watt application messaging handlers', () => {
     ])
   })
 
-  it('retries BEGIN of a batch on a broken pooled connection', async () => {
-    const { clients, messaging } = await loadApp({ beginFailures: 1 })
+  it('retries a batch whose BEGIN a pooler refused', async () => {
+    const { clients, messaging } = await loadApp({
+      beginFailures: 1,
+      beginError: () =>
+        Object.assign(new MockDatabaseError('no more connections allowed (max_client_conn)'), {
+          code: '08P01',
+        }),
+    })
 
     const response = await messaging.send('database', 'database.batch', {
       destination: createDestination(),
@@ -780,6 +803,23 @@ describe('database Watt application messaging handlers', () => {
     expect(clients).toHaveLength(2)
     expect(clients[0].release).toHaveBeenCalledWith(expect.any(Error))
     expect(clients[1].queries.map((query) => query.sql)).toEqual(['BEGIN', 'SELECT 1', 'COMMIT'])
+  })
+
+  it('does not retry a batch whose connection failed after it was written', async () => {
+    // BEGIN's reply is missing, but the batch may have committed with its replies lost.
+    const { clients, messaging } = await loadApp({ beginFailures: 1 })
+
+    const response = await messaging.send('database', 'database.batch', {
+      destination: createDestination(),
+      statements: [{ sql: 'INSERT 1' }],
+      commit: true,
+    })
+
+    expect(response).toMatchObject({
+      message: 'Connection terminated unexpectedly',
+      connectionDiscarded: true,
+    })
+    expect(clients).toHaveLength(1)
   })
 
   it.each([
